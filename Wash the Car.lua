@@ -1,10 +1,12 @@
 --[[
-    PuckAFK | Wash the Car | Smart Autofarm v1.10
+    PuckAFK | Wash the Car | Smart Autofarm v1.11
     Place 70733580049633
     Audited against the supplied 2026-10-19 .rbxl and network log.
 
     Smart tycoon purchases, legitimate client-side dirt erasing, native-format
     spray batching, free bonuses, player upgrades, offline claim and smooth travel.
+    v1.11: one Space-entry toggle, easy door retry, local doorway marker,
+    targeted portal logs with copyable debug report and live transition events.
     v1.10: Space-first control loop and portal detector overhaul; actual live
     blue doorway outranks delayed unlock state, Space entry pauses ground
     farming, retries find the door, and Space washing outranks personal buys.
@@ -95,6 +97,8 @@ local state = {
     spaceCommitted = false, spaceResidence = 'Waiting for unlock', spaceDoorReady = false,
     portalScanAt = 0, portalScanResult = nil, portalCandidates = 0,
     portalLocation = 'Unknown', portalPriority = 'Ground until Space unlock',
+    portalLastError = 'None', portalTransition = 'Not observed',
+    portalDetectedBy = 'None', manualDoor = nil, portalLastTry = 0,
 }
 local PlaneConfig, PlanePaths, SpaceConfig
 local planePathCache = setmetatable({}, {__mode = 'k'})
@@ -106,7 +110,23 @@ local vehicleProgress = setmetatable({}, {__mode = 'k'})
 local connections = {}
 local travelCollisions = {}
 local travelActive = false
-local ui, window, statusLabel, detailLabel
+local ui, window, statusLabel, detailLabel, doorDebugLabel, doorLogLabel
+local doorLogs = {}
+local function doorLog(event, detail)
+    local message = string.format('[+%.1fs] %s%s', os.clock()-startedAt, tostring(event),
+        detail and (' | '..tostring(detail)) or '')
+    if doorLogs[#doorLogs] ~= message then
+        doorLogs[#doorLogs+1] = message
+        if #doorLogs > 45 then table.remove(doorLogs,1) end
+        warn('[PuckAFK Wash][Space Door] '..message)
+    end
+end
+local function portalPhase(phase, message)
+    if state.portalPhase ~= phase then
+        state.portalPhase = phase
+        doorLog(phase,message)
+    end
+end
 
 local function status(msg)
     state.status = msg
@@ -456,6 +476,12 @@ local function highWorld(position)
 end
 local function portalEntry(plot)
     if not plot or not plot.Parent then return nil end
+    if state.manualDoor and state.manualDoor.plot == plot then
+        state.portalLocation = 'Manual entrance mark'
+        state.portalDetectedBy = 'Manual'
+        state.portalCandidates = 1
+        return state.manualDoor
+    end
     local now = os.clock()
     local cached = state.portalScanResult
     if now - state.portalScanAt < 0.85 then
@@ -518,8 +544,10 @@ local function portalEntry(plot)
     if best then
         state.portalScanResult = best
         state.portalLocation = best:GetFullName()
+        state.portalDetectedBy = 'Automatic'
         return best
     end
+    state.portalDetectedBy = 'None'
     return nil
 end
 local function portalExit()
@@ -537,21 +565,22 @@ end
 -- Walk through the entrance using the Humanoid so the SERVER receives
 -- physical character contact. CFrame tweens alone may never fire Touched.
 local function walkBlueDoor(entry)
-    if not entry or not entry:IsA('BasePart') then return false end
+    local manual = type(entry) == 'table' and entry.manual == true
+    if not manual and (not entry or not entry:IsA('BasePart')) then return false end
     local _, root, humanoid = character()
     if not root or not humanoid or humanoid.Health <= 0 then return false end
 
     local center = entry.Position
     -- A portal is normally a thin upright panel. Its thinnest horizontal
     -- dimension indicates the side from which to walk through the doorway.
-    local axis = (entry.Size.X < entry.Size.Z)
-        and entry.CFrame.RightVector or entry.CFrame.LookVector
+    local axis = manual and entry.axis or ((entry.Size.X < entry.Size.Z)
+        and entry.CFrame.RightVector or entry.CFrame.LookVector)
     axis = Vector3.new(axis.X,0,axis.Z)
     if axis.Magnitude < 0.05 then return false end
     axis = axis.Unit
     local frontSign = (root.Position - center):Dot(axis) >= 0 and 1 or -1
-    -- Alternate entry direction if the doorway-facing convention is reversed.
-    if state.portalFailures % 2 == 1 then frontSign = -frontSign end
+    -- Approach from the character's actual side. Reversing based on failures
+    -- could previously stage behind a solid rocket wall.
     local portalBottom = center.Y - entry.Size.Y * 0.5
     local height = portalBottom + 3
     -- For unusually thin visual triggers preserve the player platform height.
@@ -563,21 +592,24 @@ local function walkBlueDoor(entry)
     -- Stage just outside the doorway with the existing smooth travel logic.
     -- Even if the stage clips the trigger, verify teleport before proceeding.
     status('Approaching the blue SPACE BASE doorway')
+    portalPhase('Approaching door',string.format('distance %.1f studs', (root.Position-from).Magnitude))
     if (root.Position - from).Magnitude > 3.5 then
         tweenDirect(from, center, 35)
         if portalReached(true) then return true end
     end
-    if not alive or not settings.master or not entry:IsDescendantOf(WS) then return false end
+    if not alive or not settings.master or (not manual and not entry:IsDescendantOf(WS)) then return false end
     local _, stagedRoot = character()
     if not stagedRoot or (stagedRoot.Position - from).Magnitude > 12 then
         status('Space doorway approach incomplete; retrying safely')
+        state.portalLastError = 'Unable to reach approach point'
+        doorLog('Approach failed',string.format('distance %.1f studs', stagedRoot and (stagedRoot.Position-from).Magnitude or -1))
         return false
     end
     cancelTravel() -- Restore collisions: allow a real Humanoid contact event.
     local _, liveRoot, liveHum = character()
     if not liveRoot or not liveHum or liveHum.Health <= 0 then return false end
     status('Walking through the blue SPACE BASE door')
-    state.portalPhase = 'Walking through doorway'
+    portalPhase('Walking through doorway', state.portalDetectedBy)
     liveHum:MoveTo(through)
     local deadline = os.clock() + 9
     local lastPosition = liveRoot.Position
@@ -608,14 +640,18 @@ local function walkBlueDoor(entry)
         end
         task.wait(0.09)
     end
+    if not portalReached(true) then
+        state.portalLastError = 'Crossed doorway but no Space teleport was confirmed'
+        doorLog('Door did not teleport',string.format('pos %.1f,%.1f,%.1f',liveRoot.Position.X,liveRoot.Position.Y,liveRoot.Position.Z))
+    end
     return portalReached(true)
 end
 
 local function activatePortal(trigger, spaceDestination)
-    if not (trigger and trigger.Parent and trigger:IsDescendantOf(WS)) then return false end
+    local manual = type(trigger) == 'table' and trigger.manual == true
+    if not manual and not (trigger and trigger.Parent and trigger:IsDescendantOf(WS)) then return false end
     if spaceDestination then
-        -- First try from the player's current side; if the portal is mounted
-        -- backwards, approach from the opposite side on the next attempt.
+        -- Walk through from the player's actual side.
         return walkBlueDoor(trigger)
     end
     -- Return portal still has a real ReturnTouch physical trigger.
@@ -638,7 +674,7 @@ local function activatePortal(trigger, spaceDestination)
     return false
 end
 local function useSpacePortal(spaceDestination)
-    if not settings.useSpaceDoor or not alive or not settings.master then return false end
+    if not (settings.useSpaceDoor or settings.autoEnterAndStaySpace) or not alive or not settings.master then return false end
     if portalReached(spaceDestination) then return true end
     if os.clock() < state.portalRetryAfter then return false end
     local plot = ownPlot()
@@ -647,21 +683,26 @@ local function useSpacePortal(spaceDestination)
     -- physical doorway is the stronger readiness signal.
     local trigger = spaceDestination and portalEntry(plot) or portalExit()
     if not trigger then
+        state.portalLastError = spaceDestination and 'Door part not found in live plot' or 'ReturnTouch not loaded'
+        portalPhase('Door not found',state.portalLastError)
         status(spaceDestination and 'Waiting for live blue SPACE BASE doorway' or 'ReturnTouch portal not loaded yet')
         state.portalRetryAfter = os.clock() + 7
         return false
     end
+    state.portalLastTry = os.clock()
+    portalPhase('Entering doorway',state.portalLocation)
     local success = activatePortal(trigger,spaceDestination)
     if success then
         state.portalTrips += 1
-        state.portalPhase = 'Idle'
+        state.portalLastError = 'None'
+        portalPhase('In Space',state.portalDetectedBy)
         state.lastAction = os.clock()
         status(spaceDestination and 'Space teleporter entered successfully' or 'Returned to ground through Space portal')
         waitActive(0.3)
         return true
     end
     state.portalFailures += 1
-    state.portalPhase = 'Retry pending'
+    portalPhase('Retry pending',state.portalLastError)
     state.portalRetryAfter = os.clock() + 12
     status('Door crossing not confirmed; retrying after cooldown')
     return false
@@ -701,7 +742,9 @@ local function spaceUnlocked(plot, liveDoor)
     return false
 end
 local function wantsSpaceResidence(plot)
-    return settings.autoEnterAndStaySpace and settings.useSpaceDoor and plot
+    -- A single visible toggle controls the complete space journey.
+    -- Old persisted useSpaceDoor=false must not silently block auto entry.
+    return settings.autoEnterAndStaySpace and plot
 end
 local function spaceOnlyTargets(plot)
     return wantsSpaceResidence(plot) and state.spaceCommitted
@@ -711,6 +754,7 @@ local function enforceSpaceResidence(plot)
         state.spaceCommitted = false
         state.spaceDoorReady = false
         state.spaceResidence = 'Space-first disabled'
+        state.portalPriority = 'Normal farming'
         return false
     end
     if portalReached(true) then
@@ -718,6 +762,7 @@ local function enforceSpaceResidence(plot)
         state.spaceDoorReady = true
         state.spaceResidence = 'Staying in Space'
         state.portalPriority = 'Space only'
+        portalPhase('In Space','Arrival verified')
         return false
     end
     -- Check the live door FIRST. The original loop incorrectly returned
@@ -734,7 +779,9 @@ local function enforceSpaceResidence(plot)
     state.portalPriority = 'Portal entry (ground paused)'
     if not door then
         state.spaceResidence = 'Space ready; locating live blue doorway'
-        status('Space unlocked: searching for the blue SPACE BASE entrance ('..state.portalCandidates..' candidates)')
+        status('Space unlocked: doorway not detected; open Debug for details')
+        state.portalLastError = 'Door part not found - use Mark Door Here if needed'
+        portalPhase('Door not found','Rocket may contain empty placeholder models')
         return true
     end
     if os.clock() < state.portalRetryAfter then
@@ -743,7 +790,7 @@ local function enforceSpaceResidence(plot)
         return true
     end
     state.spaceResidence = 'Entering Space'
-    state.portalPhase = 'Walking through blue door'
+    portalPhase('Starting door attempt', state.portalDetectedBy)
     if useSpacePortal(true) then
         state.spaceResidence = 'Staying in Space'
         state.portalPriority = 'Space only'
@@ -751,6 +798,70 @@ local function enforceSpaceResidence(plot)
         state.spaceResidence = 'Retrying blue doorway'
     end
     return true
+end
+
+local function vecText(v)
+    if typeof(v) ~= 'Vector3' then return 'none' end
+    return string.format('(%.1f, %.1f, %.1f)',v.X,v.Y,v.Z)
+end
+local function doorReport()
+    local p = ownPlot()
+    local _, root = character()
+    local rocket = p and p:FindFirstChild('SpaceRocket',true)
+    local decor = p and p:FindFirstChild('Decor')
+    local savedDoor = rocket and rocket:FindFirstChild('PortalDoor')
+    local parts = 0
+    local closeCandidates = {}
+    local center = rocket and rocket:GetPivot().Position or (root and root.Position)
+    if p then
+        for _, v in ipairs(p:GetDescendants()) do
+            if v:IsA('BasePart') and center and (v.Position-center).Magnitude < 95 then
+                local n = v.Name:lower()
+                local cyan = v.Color.B > .72 and v.Color.G > .58 and v.Color.R < .6
+                if cyan or n:find('portal',1,true) or n:find('door',1,true)
+                    or n:find('boarding',1,true) or n:find('teleport',1,true) then
+                    parts += 1
+                    if #closeCandidates < 18 then
+                        closeCandidates[#closeCandidates+1] = string.format('%s | %s | Size %s | Touch %s | Hidden %s',
+                            v:GetFullName(),vecText(v.Position),vecText(v.Size),tostring(v.CanTouch),
+                            tostring(v:GetAttribute('_lvHidden')))
+                    end
+                end
+            end
+        end
+    end
+    local ret = {
+        'PuckAFK Wash the Car v1.11 / Space Door Debug',
+        'Runtime: '..string.format('%.1fs', os.clock()-startedAt),
+        'State: '..state.status,
+        'Phase: '..state.portalPhase,
+        'Last failure: '..state.portalLastError,
+        'Portal transition: '..state.portalTransition,
+        'Space residence: '..state.spaceResidence,
+        'Priority: '..state.portalPriority,
+        'Space auto mode: '..tostring(settings.autoEnterAndStaySpace),
+        'Master enabled: '..tostring(settings.master),
+        'SpaceZoneActive: '..tostring(p and p:GetAttribute('SpaceZoneActive')),
+        'Plot: '..(p and p:GetFullName() or 'Not found'),
+        'Character: '..(root and vecText(root.Position) or 'Not found'),
+        'Rocket: '..(rocket and rocket:GetFullName() or 'Not found'),
+        'Rocket pivot: '..(rocket and vecText(rocket:GetPivot().Position) or 'none'),
+        'Decor: '..(decor and decor:GetFullName() or 'Not found'),
+        'PortalDoor model: '..(savedDoor and savedDoor:GetFullName() or 'Not found'),
+        'PortalDoor children: '..(savedDoor and tostring(#savedDoor:GetDescendants()) or 'none'),
+        'Door selection: '..state.portalDetectedBy,
+        'Selected door: '..state.portalLocation,
+        'Door candidates: '..tostring(state.portalCandidates),
+        'Nearby blue/door parts: '..tostring(parts),
+        'Manual door marker: '..(state.manualDoor and vecText(state.manualDoor.Position) or 'none'),
+        'Portal successes/failures: '..state.portalTrips..' / '..state.portalFailures,
+        'Retry seconds: '..tostring(math.max(0,math.ceil(state.portalRetryAfter-os.clock()))),
+        'Nearby candidate sample:',
+    }
+    for _, s in ipairs(closeCandidates) do ret[#ret+1] = s end
+    ret[#ret+1] = 'Recent door events:'
+    for _, s in ipairs(doorLogs) do ret[#ret+1] = s end
+    return table.concat(ret,'\n')
 end
 
 local Wash = RS:WaitForChild('Wash', 20)
@@ -779,6 +890,14 @@ local OfflineClaim = RS:FindFirstChild('OfflineClaim')
 local bonusFolder = RS:FindFirstChild('BonusBillboard')
 local bonusHit = bonusFolder and bonusFolder:FindFirstChild('Hit')
 local bonusSpawn = bonusFolder and bonusFolder:FindFirstChild('Spawn')
+local spaceFolder = RS:FindFirstChild('Space')
+local transitionEvent = spaceFolder and spaceFolder:FindFirstChild('TransitionEvent')
+if transitionEvent and transitionEvent:IsA('RemoteEvent') then
+    addConnection(transitionEvent.OnClientEvent:Connect(function(phase)
+        state.portalTransition = tostring(phase)
+        doorLog('Server transition event', tostring(phase))
+    end))
+end
 local PuckUI = try('PuckUI', function()
     return loadstring(game:HttpGet('https://raw.githubusercontent.com/PuckAFK/Puck-Loader/refs/heads/main/ui/PuckUI.lua'))()
 end)
@@ -1758,8 +1877,7 @@ options:CreateToggle({Name='Wash Parked Spacecraft',CurrentValue=settings.spaceW
 options:CreateToggle({Name='Buy Space Stands & Equipment',CurrentValue=settings.spacePurchases,Callback=function(v) settings.spacePurchases=v end})
 options:CreateToggle({Name='Focus Space Progression',CurrentValue=settings.spaceFocus,Callback=function(v) settings.spaceFocus=v end})
 options:CreateToggle({Name='Fast Spaceship Hull Cleaning',CurrentValue=settings.fastSpaceWash,Callback=function(v) settings.fastSpaceWash=v end})
-options:CreateToggle({Name='Use Blue Door to Travel to Space',CurrentValue=settings.useSpaceDoor,Callback=function(v) settings.useSpaceDoor=v end})
-options:CreateToggle({Name='Auto Enter Blue Door & Stay in Space',CurrentValue=settings.autoEnterAndStaySpace,Callback=function(v)
+options:CreateToggle({Name='Auto Enter & Stay in Space',CurrentValue=settings.autoEnterAndStaySpace,Callback=function(v)
     settings.autoEnterAndStaySpace=v
     if not v then
         state.spaceCommitted=false
@@ -1779,6 +1897,54 @@ options:CreateSlider({Name='Cash Reserve',Range={0,20},Increment=1,CurrentValue=
 options:CreateSection('Free income')
 options:CreateToggle({Name='Collect Free Bonuses',CurrentValue=settings.bonuses,Callback=function(v) settings.bonuses=v end})
 options:CreateToggle({Name='Claim Offline Earnings (1x)',CurrentValue=settings.offline,Callback=function(v) settings.offline=v end})
+local debugTab = window:CreateTab('Debug')
+debugTab:CreateSection('Space doorway')
+doorDebugLabel = debugTab:CreateLabel('Waiting for Space door check')
+doorLogLabel = debugTab:CreateLabel('Recent door activity will appear here')
+debugTab:CreateButton({Name='Retry Blue Door Now',Callback=function()
+    state.portalRetryAfter = 0
+    state.portalScanAt = 0
+    state.portalScanResult = nil
+    doorLog('Manual retry requested','Controller will try on its next tick')
+    status('Retrying Space doorway')
+end})
+debugTab:CreateButton({Name='Mark Door Here (stand facing blue door)',Callback=function()
+    local p = ownPlot()
+    local _, root = character()
+    if not p or not root or highWorld(root.Position) then
+        doorLog('Door mark failed','Stand at ground door on your own plot')
+        return
+    end
+    local forward = Vector3.new(root.CFrame.LookVector.X,0,root.CFrame.LookVector.Z)
+    if forward.Magnitude < .01 then return end
+    forward = forward.Unit
+    state.manualDoor = {
+        manual=true, plot=p, Position=root.Position + forward*3.5 + Vector3.new(0,1.5,0),
+        Size=Vector3.new(1,9,8), axis=forward,
+    }
+    state.portalScanAt=0
+    state.portalRetryAfter=0
+    state.portalDetectedBy='Manual'
+    doorLog('Manual entrance marked','Facing '..vecText(forward)..' | Position '..vecText(state.manualDoor.Position))
+    status('Blue door marked; approaching and walking through it')
+end})
+debugTab:CreateButton({Name='Clear Manual Door Mark',Callback=function()
+    state.manualDoor=nil
+    state.portalScanAt=0
+    state.portalScanResult=nil
+    doorLog('Manual mark cleared','Back to automatic doorway detection')
+end})
+debugTab:CreateButton({Name='Copy Space Debug',Callback=function()
+    local report=doorReport()
+    local clip = (type(setclipboard)=='function' and setclipboard)
+        or (type(toclipboard)=='function' and toclipboard)
+    if clip then
+        local ok = pcall(clip,report)
+        if ok then doorLog('Debug copied','Paste the report in chat'); return end
+    end
+    warn('[PuckAFK Wash][Space Door DEBUG]\n'..report)
+    doorLog('Clipboard unavailable','Report printed to executor console')
+end})
 local advanced = window:CreateTab('Settings')
 advanced:CreateSection('Movement & washing')
 advanced:CreateSlider({Name='Tween Speed',Range={40,250},Increment=5,CurrentValue=settings.tweenSpeed,Suffix=' studs/s',Callback=function(v) settings.tweenSpeed=v end})
@@ -1810,6 +1976,18 @@ task.spawn(function()
             if os.clock() - lastUi > .6 then
                 lastUi = os.clock()
                 if statusLabel then statusLabel:Set(state.status) end
+                if doorDebugLabel then
+                    local remaining=math.max(0,math.ceil(state.portalRetryAfter-os.clock()))
+                    doorDebugLabel:Set('Phase: '..state.portalPhase..' | Door: '..state.portalDetectedBy
+                        ..' | Ready: '..tostring(state.spaceDoorReady)..' | Attempts: '
+                        ..tostring(state.portalTrips+state.portalFailures)..' | Retry: '..remaining..'s'
+                        ..' | Error: '..state.portalLastError)
+                end
+                if doorLogLabel then
+                    local rows={}
+                    for i=math.max(1,#doorLogs-3),#doorLogs do rows[#rows+1]=doorLogs[i] end
+                    doorLogLabel:Set(#rows>0 and table.concat(rows,' / ') or 'No door attempts yet')
+                end
                 if detailLabel then detailLabel:Set('Cash '..money(cash())..' | '..state.bought..' buys | '..state.sprays..' sprays | '..state.bonuses..' bonuses | '..state.availablePurchasePads..' buyable | Boats '..state.boatBuys..' buys / '..state.boatSprays..' sprays | Planes '..state.planeBuys..' buys / '..state.planeSprays..' sprays | Space '..state.spaceBuys..' buys / '..state.spaceSprays..' sprays | Portal '..state.spaceResidence..' | Priority '..state.portalPriority..' | Trips '..state.portalTrips..' / '..state.portalFailures..' fails') end
             end
             local nowCash = cash()
@@ -1829,6 +2007,8 @@ task.spawn(function()
                 state.spaceResidence = 'Checking door'
                 state.portalScanAt = 0
                 state.portalScanResult = nil
+                state.manualDoor = nil -- A mark from another plot/server is unsafe.
+                doorLog('Plot identified',plot:GetFullName())
             end
             local _, root = character()
             if not root then status('Respawning'); task.wait(.5); return end
@@ -1868,6 +2048,8 @@ task.spawn(function()
             state.failed += 1
             warn('[PuckAFK Wash][controller] '..tostring(errorText))
             status('Recovering from controller error')
+            state.portalLastError = 'Controller: '..tostring(errorText)
+            doorLog('Controller error',tostring(errorText))
             waitActive(0.8)
         else
             task.wait(.03)
@@ -1875,4 +2057,4 @@ task.spawn(function()
     end
 end)
 
-PuckUI:Notify({Title='Wash the Car v1.10',Content='Space portal is the top priority: enter through the live blue door, pause ground farming and stay in Space.',Duration=5})
+PuckUI:Notify({Title='Wash the Car v1.11',Content='Simpler Space entry. Open Debug to retry, mark the blue door if needed, or copy a failure report.',Duration=5})
