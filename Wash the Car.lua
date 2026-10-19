@@ -1,10 +1,12 @@
 --[[
-    PuckAFK | Wash the Car | Smart Autofarm v1.6
+    PuckAFK | Wash the Car | Smart Autofarm v1.7
     Place 70733580049633
     Audited against the supplied 2026-10-19 .rbxl and network log.
 
     Smart tycoon purchases, legitimate client-side dirt erasing, native-format
     spray batching, free bonuses, player upgrades, offline claim and smooth travel.
+    v1.7: actual SpaceRocket blue-door entry and ReturnTouch exit, no direct
+    cross-zone altitude tween, portal activation checks and recovery.
     v1.6: Space pads/upgrade chains, parked spacecraft tracking, warp-route guards,
     starship surface coverage, altitude-aware smooth travel and Space controls.
     v1.5: parked-aircraft safeguards, runway exclusion, wing/fuselage sampling,
@@ -63,7 +65,7 @@ local settings = {
     fastPlaneWash = true,
     spaceWash = true, spacePurchases = true, spaceFocus = true,
     fastSpaceWash = true, spaceSpacing = 3.0, spaceRayBudget = 140,
-    spaceStandRadius = 76, spaceTravelSpeed = 240,
+    spaceStandRadius = 76, spaceTravelSpeed = 240, useSpaceDoor = true,
 }
 local state = {
     status = 'Starting', plot = nil, target = nil, currentTween = nil,
@@ -79,6 +81,7 @@ local state = {
     carsOutOfRange = 0, boatRayHits = 0,
     planesDetected = 0, planeSprays = 0, planeBuys = 0, planesOutOfStand = 0,
     shipsDetected = 0, spaceSprays = 0, spaceBuys = 0, shipsOutOfStand = 0,
+    portalTrips = 0, portalFailures = 0, portalRetryAfter = 0, portalPhase = 'Idle',
 }
 local PlaneConfig, PlanePaths, SpaceConfig
 local planePathCache = setmetatable({}, {__mode = 'k'})
@@ -383,7 +386,7 @@ addConnection(RunService.Stepped:Connect(function()
         end
     end
 end))
-local function tweenTo(point, lookAt, maxTime)
+local function tweenDirect(point, lookAt, maxTime)
     local c, root, hum = character()
     if not root then return false end
     if typeof(point) ~= 'Vector3' then return false end
@@ -394,11 +397,12 @@ local function tweenTo(point, lookAt, maxTime)
     local direction = lookAt and Vector3.new(lookAt.X - point.X, 0, lookAt.Z - point.Z)
     if not direction or direction.Magnitude < 0.01 then direction = root.CFrame.LookVector end
     local goal = CFrame.lookAt(point, point + direction.Unit)
-    local longSpaceLeg = math.abs(point.Y - root.Position.Y) > 850
-       and math.max(point.Y, root.Position.Y) > 1000
-    local speed = longSpaceLeg and math.max(tonumber(settings.spaceTravelSpeed) or 240, 40)
+    -- Space-leg speed applies only after the door actually delivered us to
+    -- the elevated world, never to a direct ground-to-Space climb.
+    local inSpaceLeg = root.Position.Y > 2200 and point.Y > 2200
+    local speed = inSpaceLeg and math.max(tonumber(settings.spaceTravelSpeed) or 240, 40)
         or math.max(tonumber(settings.tweenSpeed) or 100, 20)
-    local duration = longSpaceLeg and math.max(0.08, dist / speed)
+    local duration = inSpaceLeg and math.clamp(dist / speed, 0.08, maxTime or 30)
         or math.clamp(dist / speed, 0.08, maxTime or 18)
     local activeTween = TweenService:Create(root, TweenInfo.new(duration, Enum.EasingStyle.Linear), {CFrame = goal})
     state.currentTween = activeTween
@@ -407,9 +411,14 @@ local function tweenTo(point, lookAt, maxTime)
     local completed = activeTween.Completed:Connect(function() finish = true end)
     activeTween:Play()
     local stopAt = os.clock() + duration + 1.6
+    local previousPosition = root.Position
     while alive and state.moveToken == token and not finish and os.clock() < stopAt do
         local _, nowRoot = character()
         if nowRoot ~= root or not root.Parent then break end
+        -- A server portal may relocate the same HumanoidRootPart during a tween.
+        -- Stop immediately instead of dragging the character back to the door.
+        if (root.Position - previousPosition).Magnitude > 450 then break end
+        previousPosition = root.Position
         task.wait(0.04)
     end
     completed:Disconnect()
@@ -422,6 +431,134 @@ local function tweenTo(point, lookAt, maxTime)
     end
     local _, newRoot = character()
     return alive and state.moveToken == token and newRoot and (newRoot.Position - point).Magnitude < 7
+end
+
+-- Both halves of Space live in one Roblox place, but legitimate entry is
+-- through the blue door by our own launch rocket, NOT a 4000-stud sky tween.
+-- The recorded dump contains a PortalDoor model with an empty Boarding shell;
+-- its actual trigger can be constructed only once the zone is activated.
+-- Discover a live touch part each time, and fail safely when it has not loaded.
+local function highWorld(position)
+    return typeof(position) == 'Vector3' and position.Y > 2200
+end
+local function portalEntry(plot)
+    local decor = plot and plot:FindFirstChild('Decor')
+    local rocket = decor and decor:FindFirstChild('SpaceRocket')
+    local door = rocket and rocket:FindFirstChild('PortalDoor')
+    if not door then return nil end
+    local best, bestScore
+    for _, item in ipairs(door:GetDescendants()) do
+        if item:IsA('BasePart') and item:IsDescendantOf(WS)
+           and item.CanTouch and not paidAncestor(item) then
+            local label = item.Name:lower()
+            local score = 0
+            if label:find('touch',1,true) or label:find('trigger',1,true) then score += 100 end
+            if label:find('portal',1,true) or label:find('teleport',1,true) then score += 80 end
+            if label:find('door',1,true) or label:find('entry',1,true)
+               or label:find('enter',1,true) then score += 55 end
+            if item.Color.B > item.Color.R + 0.18 and item.Color.B > item.Color.G * 0.72 then score += 12 end
+            if label:find('frame',1,true) or label:find('sign',1,true) then score -= 45 end
+            if not best or score > bestScore then best,bestScore = item,score end
+        end
+    end
+    return best
+end
+local function portalExit()
+    local world = WS:FindFirstChild('SpaceWorld')
+    local base = world and world:FindFirstChild('SpaceBase')
+    local returnModel = base and base:FindFirstChild('ReturnPortal')
+    local part = returnModel and returnModel:FindFirstChild('ReturnTouch')
+    if part and part:IsA('BasePart') and part:IsDescendantOf(WS)
+        and part.CanTouch then return part end
+end
+local function portalReached(spaceDestination)
+    local _, r = character()
+    return r ~= nil and highWorld(r.Position) == spaceDestination
+end
+local function activatePortal(trigger, spaceDestination)
+    if not (trigger and trigger.Parent and trigger:IsDescendantOf(WS) and trigger.CanTouch) then return false end
+    for side = 1, 2 do
+        if portalReached(spaceDestination) then return true end
+        local _, root = character()
+        if not root then return false end
+        local facing = Vector3.new(trigger.CFrame.LookVector.X, 0, trigger.CFrame.LookVector.Z)
+        if facing.Magnitude < 0.01 then facing = Vector3.new(0,0,1) end
+        facing = facing.Unit
+        local ahead = trigger.Position + facing * (side == 1 and -4 or 4)
+        local doorway = trigger.Position + Vector3.new(0, math.clamp(trigger.Size.Y*.08,0.2,2),0)
+        local near = Vector3.new(ahead.X,doorway.Y,ahead.Z)
+        if (root.Position - near).Magnitude > 4 then
+            tweenDirect(near, doorway, 20)
+            if portalReached(spaceDestination) then return true end
+        end
+        if not alive or not settings.master then return false end
+        state.portalPhase = spaceDestination and 'Entering Space' or 'Returning to plot'
+        status((spaceDestination and 'Entering blue Space door' or 'Using Space return portal') .. ' ('..side..'/2)')
+        -- Walk through the actual touch part: no teleport/zone remote guessing.
+        tweenDirect(doorway + facing * (side == 1 and 3 or -3), doorway, 8)
+        if portalReached(spaceDestination) then return true end
+        local _, touchingRoot = character()
+        if touchingRoot and (touchingRoot.Position-trigger.Position).Magnitude < 15 then
+            if type(firetouchinterest) == 'function' then
+                pcall(firetouchinterest, touchingRoot, trigger, 0)
+                waitActive(0.12)
+                pcall(firetouchinterest, touchingRoot, trigger, 1)
+            end
+            local prompt = trigger:FindFirstChildWhichIsA('ProximityPrompt', true)
+            if prompt and prompt.Enabled and type(fireproximityprompt) == 'function' then
+                pcall(fireproximityprompt, prompt)
+            end
+        end
+        local untilTime = os.clock() + 3.8
+        while alive and settings.master and os.clock() < untilTime do
+            if portalReached(spaceDestination) then return true end
+            task.wait(0.12)
+        end
+    end
+    return false
+end
+local function useSpacePortal(spaceDestination)
+    if not settings.useSpaceDoor or not alive or not settings.master then return false end
+    if portalReached(spaceDestination) then return true end
+    if os.clock() < state.portalRetryAfter then return false end
+    local plot = ownPlot()
+    if not plot then return false end
+    if spaceDestination and plot:GetAttribute('SpaceZoneActive') ~= true then
+        status('Space is locked; waiting for Space Zone unlock')
+        state.portalRetryAfter = os.clock() + 8
+        return false
+    end
+    local trigger = spaceDestination and portalEntry(plot) or portalExit()
+    if not trigger then
+        status(spaceDestination and 'Blue Space door not loaded yet' or 'ReturnTouch portal not loaded yet')
+        state.portalRetryAfter = os.clock() + 7
+        return false
+    end
+    local success = activatePortal(trigger,spaceDestination)
+    if success then
+        state.portalTrips += 1
+        state.portalPhase = 'Idle'
+        state.lastAction = os.clock()
+        status(spaceDestination and 'Space teleporter entered successfully' or 'Returned to ground through Space portal')
+        waitActive(0.3)
+        return true
+    end
+    state.portalFailures += 1
+    state.portalPhase = 'Retry pending'
+    state.portalRetryAfter = os.clock() + 12
+    status('Blue-door portal did not move player; retrying after cooldown')
+    return false
+end
+local function tweenTo(point, lookAt, maxTime)
+    local _, root = character()
+    if not root or typeof(point) ~= 'Vector3' then return false end
+    -- Mandatory both-way transition: never tween between Y=0 and Y=4000.
+    local spaceDestination = highWorld(point)
+    if highWorld(root.Position) ~= spaceDestination then
+        if not useSpacePortal(spaceDestination) then return false end
+    end
+    if not portalReached(spaceDestination) then return false end
+    return tweenDirect(point,lookAt,maxTime)
 end
 
 local Wash = RS:WaitForChild('Wash', 20)
@@ -1427,6 +1564,7 @@ options:CreateToggle({Name='Wash Parked Spacecraft',CurrentValue=settings.spaceW
 options:CreateToggle({Name='Buy Space Stands & Equipment',CurrentValue=settings.spacePurchases,Callback=function(v) settings.spacePurchases=v end})
 options:CreateToggle({Name='Focus Space Progression',CurrentValue=settings.spaceFocus,Callback=function(v) settings.spaceFocus=v end})
 options:CreateToggle({Name='Fast Spaceship Hull Cleaning',CurrentValue=settings.fastSpaceWash,Callback=function(v) settings.fastSpaceWash=v end})
+options:CreateToggle({Name='Use Blue Door to Travel to Space',CurrentValue=settings.useSpaceDoor,Callback=function(v) settings.useSpaceDoor=v end})
 options:CreateSection('Expansion')
 options:CreateToggle({Name='Unlock New Zones',CurrentValue=settings.zones,Callback=function(v) settings.zones=v end})
 options:CreateToggle({Name='Buy Decorations',CurrentValue=settings.decorations,Callback=function(v) settings.decorations=v end})
@@ -1453,7 +1591,7 @@ advanced:CreateSlider({Name='Airport Stand Radius',Range={45,95},Increment=5,Cur
 advanced:CreateSlider({Name='Spacecraft Scan Spacing',Range={1.6,7},Increment=0.2,CurrentValue=settings.spaceSpacing,Suffix=' studs',Callback=function(v) settings.spaceSpacing=v end})
 advanced:CreateSlider({Name='Spacecraft Scan Budget',Range={30,220},Increment=10,CurrentValue=settings.spaceRayBudget,Suffix=' rays',Callback=function(v) settings.spaceRayBudget=v end})
 advanced:CreateSlider({Name='Space Stand Radius',Range={48,115},Increment=5,CurrentValue=settings.spaceStandRadius,Suffix=' studs',Callback=function(v) settings.spaceStandRadius=v end})
-advanced:CreateSlider({Name='Space Altitude Tween Speed',Range={80,400},Increment=10,CurrentValue=settings.spaceTravelSpeed,Suffix=' studs/s',Callback=function(v) settings.spaceTravelSpeed=v end})
+advanced:CreateSlider({Name='Space Local Tween Speed',Range={80,400},Increment=10,CurrentValue=settings.spaceTravelSpeed,Suffix=' studs/s',Callback=function(v) settings.spaceTravelSpeed=v end})
 advanced:CreateSlider({Name='Car Bay Safety Radius',Range={45,115},Increment=5,CurrentValue=settings.carBayRadius,Suffix=' studs',Callback=function(v) settings.carBayRadius=v end})
 advanced:CreateToggle({Name='Noclip During Tween Only',CurrentValue=settings.useNoclip,Callback=function(v) settings.useNoclip=v end})
 advanced:CreateToggle({Name='Automatic Stall Recovery',CurrentValue=settings.autoRecover,Callback=function(v) settings.autoRecover=v end})
@@ -1470,7 +1608,7 @@ task.spawn(function()
             if os.clock() - lastUi > .6 then
                 lastUi = os.clock()
                 if statusLabel then statusLabel:Set(state.status) end
-                if detailLabel then detailLabel:Set('Cash '..money(cash())..' | '..state.bought..' buys | '..state.sprays..' sprays | '..state.bonuses..' bonuses | '..state.availablePurchasePads..' buyable | Boats '..state.boatBuys..' buys / '..state.boatSprays..' sprays | Planes '..state.planeBuys..' buys / '..state.planeSprays..' sprays | Space '..state.spaceBuys..' buys / '..state.spaceSprays..' sprays') end
+                if detailLabel then detailLabel:Set('Cash '..money(cash())..' | '..state.bought..' buys | '..state.sprays..' sprays | '..state.bonuses..' bonuses | '..state.availablePurchasePads..' buyable | Boats '..state.boatBuys..' buys / '..state.boatSprays..' sprays | Planes '..state.planeBuys..' buys / '..state.planeSprays..' sprays | Space '..state.spaceBuys..' buys / '..state.spaceSprays..' sprays | Portals '..state.portalTrips..' trips / '..state.portalFailures..' fails') end
             end
             local nowCash = cash()
             if nowCash ~= state.lastCash then
@@ -1518,4 +1656,4 @@ task.spawn(function()
     end
 end)
 
-PuckUI:Notify({Title='Wash the Car v1.6',Content='Space: starship stands, plasma/foam/brush/dryer upgrades, parked-only hull cleaning, no portal chasing.',Duration=5})
+PuckUI:Notify({Title='Wash the Car v1.7',Content='Space blue-door and return teleporter travel required, with verified arrivals and retry cooldowns.',Duration=5})
