@@ -1,10 +1,13 @@
 --[[
-    PuckAFK | Wash the Car | Smart Autofarm v1.9
+    PuckAFK | Wash the Car | Smart Autofarm v1.10
     Place 70733580049633
     Audited against the supplied 2026-10-19 .rbxl and network log.
 
     Smart tycoon purchases, legitimate client-side dirt erasing, native-format
     spray batching, free bonuses, player upgrades, offline claim and smooth travel.
+    v1.10: Space-first control loop and portal detector overhaul; actual live
+    blue doorway outranks delayed unlock state, Space entry pauses ground
+    farming, retries find the door, and Space washing outranks personal buys.
     v1.9: physically walk into the visible SPACE BASE blue doorway,
     discover the live cyan portal even if PortalDoor.Boarding is empty,
     verify the Space arrival, and remain there without ground detours.
@@ -90,6 +93,8 @@ local state = {
     shipsDetected = 0, spaceSprays = 0, spaceBuys = 0, shipsOutOfStand = 0,
     portalTrips = 0, portalFailures = 0, portalRetryAfter = 0, portalPhase = 'Idle',
     spaceCommitted = false, spaceResidence = 'Waiting for unlock', spaceDoorReady = false,
+    portalScanAt = 0, portalScanResult = nil, portalCandidates = 0,
+    portalLocation = 'Unknown', portalPriority = 'Ground until Space unlock',
 }
 local PlaneConfig, PlanePaths, SpaceConfig
 local planePathCache = setmetatable({}, {__mode = 'k'})
@@ -312,7 +317,7 @@ local function spaceAtStand(model, plot)
     return true
 end
 local function spaceReady(model, plot)
-    if plot:GetAttribute('SpaceZoneActive') ~= true
+    if not (plot:GetAttribute('SpaceZoneActive') == true or state.spaceCommitted)
        or not animationSettled(model) or not spaceAtStand(model,plot) then return false end
     local mode = string.lower(tostring(model:GetAttribute('BoatMode') or ''))
     if mode:find('leave',1,true) or mode:find('depart',1,true)
@@ -441,66 +446,80 @@ local function tweenDirect(point, lookAt, maxTime)
     return alive and state.moveToken == token and newRoot and (newRoot.Position - point).Magnitude < 7
 end
 
--- Both halves of Space are in one Roblox place. The ground-to-Space
--- transition is a physical WALK THROUGH the bright blue SPACE BASE doorway.
--- The saved dump contains an EMPTY PortalDoor.Boarding model, even though
--- the live rocket has a visible portal. Do not require a touchable BasePart
--- inside Boarding: find the actual live cyan portal surface on our rocket.
+-- Live portal geometry is not serialized in the newest place dump:
+-- Decor.SpaceRocket.PortalDoor.Boarding is an empty model in that snapshot.
+-- It is therefore incorrect to require a touchable child of Boarding. Locate
+-- the actual bright blue vertical entrance in the player's live plot; the
+-- physical door is authoritative even if SpaceZoneActive has not replicated.
 local function highWorld(position)
     return typeof(position) == 'Vector3' and position.Y > 2200
 end
 local function portalEntry(plot)
-    local decor = plot and plot:FindFirstChild('Decor')
+    if not plot or not plot.Parent then return nil end
+    local now = os.clock()
+    local cached = state.portalScanResult
+    if now - state.portalScanAt < 0.85 then
+        if cached == false then return nil end
+        if cached and cached:IsDescendantOf(WS) then return cached end
+    end
+    state.portalScanAt = now
+    state.portalScanResult = false
+    state.portalCandidates = 0
+    state.portalLocation = 'Not found'
+    local decor = plot:FindFirstChild('Decor')
     local rocket = decor and decor:FindFirstChild('SpaceRocket')
     local door = rocket and rocket:FindFirstChild('PortalDoor')
-    if not rocket or not rocket:IsDescendantOf(WS) then return nil end
-
-    local best, bestScore
-    local function consider(part, inDoor)
+    local best, bestScore = nil, -math.huge
+    local function consider(part)
         if not part:IsA('BasePart') or not part:IsDescendantOf(WS)
-           or paidAncestor(part) then return end
-        local label = part.Name:lower()
-        local blue = part.Color.B > 0.70 and part.Color.G > 0.56
-                     and part.Color.B > part.Color.R * 1.33
-                     and part.Color.G > part.Color.R * 1.30
-        local named = label:find('portal',1,true) or label:find('door',1,true)
-            or label:find('enter',1,true) or label:find('boarding',1,true)
-            or label:find('teleport',1,true) or label:find('horizon',1,true)
-            or label:find('touch',1,true) or label:find('trigger',1,true)
-        -- Without an actual doorway-like visual or relevant part name we must
-        -- not select random cyan rocket lights, launch rails or decorations.
-        if not (inDoor or named or (blue and part.Size.Y >= 5 and part.Size.X >= 3)) then return end
-        local score = 0
-        if inDoor then score += 100 end
-        if blue then score += 95 end
-        if part.Material == Enum.Material.Neon and blue then score += 22 end
-        if label:find('portal',1,true) or label:find('enter',1,true) then score += 80 end
-        if label:find('touch',1,true) or label:find('trigger',1,true) then score += 40 end
-        if label:find('boarding',1,true) or label:find('door',1,true) then score += 28 end
-        if part.Size.Y >= 6 and part.Size.Y <= 30 then score += 15 end
-        if part.CanTouch then score += 12 end
-        if label:find('frame',1,true) or label:find('sign',1,true)
-           or label:find('light',1,true) or label:find('rail',1,true)
-           or label:find('trim',1,true) then score -= 115 end
-        -- Prioritize the real opening over rocket trim. Do not use a physical
-        -- touch trigger only because it is first in GetDescendants order.
-        if score > (bestScore or -math.huge) then
-            best, bestScore = part, score
+            or paidAncestor(part) or highWorld(part.Position)
+            or part:GetAttribute('_lvHidden') == true then return end
+        local n = part.Name:lower()
+        local inDoor = door ~= nil and part:IsDescendantOf(door)
+        local inRocket = rocket ~= nil and part:IsDescendantOf(rocket)
+        local blue = part.Color.B >= .72 and part.Color.G >= .62
+            and part.Color.R < .52 and part.Color.B > part.Color.R * 1.25
+        local named = n:find('portal',1,true) or n:find('teleport',1,true)
+            or n:find('boarding',1,true) or n:find('horizon',1,true)
+            or n:find('enter',1,true) or n:find('door',1,true)
+        local badName = n:find('sign',1,true) or n:find('light',1,true)
+            or n:find('rail',1,true) or n:find('frame',1,true)
+            or n:find('trim',1,true) or n:find('label',1,true)
+        local height, width = part.Size.Y, math.max(part.Size.X,part.Size.Z)
+        local doorSized = height >= 5 and height <= 40 and width >= 2.5 and width <= 35
+        local trigger = named and part.CanTouch and height >= 3 and height <= 45
+        -- Ignore random cyan decoration. Accept either a visible doorway or a
+        -- door-owned physical trigger even when the trigger is transparent.
+        if badName or not ((blue and doorSized) or (trigger and (inDoor or inRocket))) then return end
+        if not inRocket and not inDoor then
+            -- Outside SpaceRocket, require a convincingly named portal panel;
+            -- no other player's plot or generic neon effects may qualify.
+            if not (blue and named and doorSized) then return end
+        end
+        state.portalCandidates += 1
+        local score = (inDoor and 140 or inRocket and 70 or 0)
+            + (blue and 110 or 0) + (doorSized and 24 or 0)
+            + (named and 42 or 0) + (part.CanTouch and 18 or 0)
+            + (part.Material == Enum.Material.Neon and 12 or 0)
+        if n:find('portal',1,true) or n:find('teleport',1,true)
+            or n:find('boarding',1,true) then score += 55 end
+        if score > bestScore then best, bestScore = part, score end
+    end
+    if rocket then
+        for _, part in ipairs(rocket:GetDescendants()) do consider(part) end
+    end
+    -- Live builds may parent the portal under a different plot decoration,
+    -- rather than replacing PortalDoor.Boarding itself.
+    if not best then
+        for _, part in ipairs(plot:GetDescendants()) do
+            if not rocket or not part:IsDescendantOf(rocket) then consider(part) end
         end
     end
-    if door then
-        for _, part in ipairs(door:GetDescendants()) do
-            consider(part, true)
-        end
+    if best then
+        state.portalScanResult = best
+        state.portalLocation = best:GetFullName()
+        return best
     end
-    -- The real visible entrance may be generated as a sibling of PortalDoor
-    -- or placed under Rocket/LaunchTower after purchasing the door.
-    if not best or (bestScore or 0) < 155 then
-        for _, part in ipairs(rocket:GetDescendants()) do
-            consider(part, door ~= nil and part:IsDescendantOf(door))
-        end
-    end
-    if best and (bestScore or 0) >= 100 then return best end
     return nil
 end
 local function portalExit()
@@ -531,6 +550,8 @@ local function walkBlueDoor(entry)
     if axis.Magnitude < 0.05 then return false end
     axis = axis.Unit
     local frontSign = (root.Position - center):Dot(axis) >= 0 and 1 or -1
+    -- Alternate entry direction if the doorway-facing convention is reversed.
+    if state.portalFailures % 2 == 1 then frontSign = -frontSign end
     local portalBottom = center.Y - entry.Size.Y * 0.5
     local height = portalBottom + 3
     -- For unusually thin visual triggers preserve the player platform height.
@@ -543,10 +564,15 @@ local function walkBlueDoor(entry)
     -- Even if the stage clips the trigger, verify teleport before proceeding.
     status('Approaching the blue SPACE BASE doorway')
     if (root.Position - from).Magnitude > 3.5 then
-        tweenDirect(from, center, 24)
+        tweenDirect(from, center, 35)
         if portalReached(true) then return true end
     end
     if not alive or not settings.master or not entry:IsDescendantOf(WS) then return false end
+    local _, stagedRoot = character()
+    if not stagedRoot or (stagedRoot.Position - from).Magnitude > 12 then
+        status('Space doorway approach incomplete; retrying safely')
+        return false
+    end
     cancelTravel() -- Restore collisions: allow a real Humanoid contact event.
     local _, liveRoot, liveHum = character()
     if not liveRoot or not liveHum or liveHum.Health <= 0 then return false end
@@ -571,7 +597,15 @@ local function walkBlueDoor(entry)
         elseif os.clock() - stoppedAt > 3.5 then
             break
         end
-        if (nowRoot.Position - through).Magnitude < 2.5 then break end
+        if (nowRoot.Position - through).Magnitude < 2.5 then
+            -- Contact may resolve on the next server frame, not immediately.
+            local untilArrival = os.clock() + 1.2
+            while alive and settings.master and os.clock() < untilArrival do
+                if portalReached(true) then return true end
+                task.wait(0.09)
+            end
+            break
+        end
         task.wait(0.09)
     end
     return portalReached(true)
@@ -609,11 +643,8 @@ local function useSpacePortal(spaceDestination)
     if os.clock() < state.portalRetryAfter then return false end
     local plot = ownPlot()
     if not plot then return false end
-    if spaceDestination and plot:GetAttribute('SpaceZoneActive') ~= true then
-        status('Space is locked; waiting for Space Zone unlock')
-        state.portalRetryAfter = os.clock() + 8
-        return false
-    end
+    -- Do NOT gate a visibly usable blue door on SpaceZoneActive. The live
+    -- physical doorway is the stronger readiness signal.
     local trigger = spaceDestination and portalEntry(plot) or portalExit()
     if not trigger then
         status(spaceDestination and 'Waiting for live blue SPACE BASE doorway' or 'ReturnTouch portal not loaded yet')
@@ -653,13 +684,24 @@ local function tweenTo(point, lookAt, maxTime)
     return tweenDirect(point,lookAt,maxTime)
 end
 
--- Space is a progression phase, not simply another scored destination.
--- Door readiness uses the actual replicated Space unlock AND a visible
--- portal part generated on the live rocket. Saved PortalDoor.Boarding is empty;
--- a real Humanoid crossing can activate the destination's server touch sensor.
+-- Highest priority: Space entry wins before any ground purchase/wash.
+-- Three states: not unlocked (ground may farm), entering (ground paused),
+-- resident (Space-only targets and no return portal). The live physical blue
+-- door can enable entry even when the zone unlock attribute is delayed.
+local function spaceUnlocked(plot, liveDoor)
+    if plot:GetAttribute('SpaceZoneActive') == true or liveDoor ~= nil then
+        return true
+    end
+    local slots = plot:FindFirstChild('SpaceSlots')
+    if slots then
+        for _, slot in ipairs(slots:GetChildren()) do
+            if slot:GetAttribute('Active') == true then return true end
+        end
+    end
+    return false
+end
 local function wantsSpaceResidence(plot)
     return settings.autoEnterAndStaySpace and settings.useSpaceDoor and plot
-       and (plot:GetAttribute('SpaceZoneActive') == true or state.spaceCommitted)
 end
 local function spaceOnlyTargets(plot)
     return wantsSpaceResidence(plot) and state.spaceCommitted
@@ -668,37 +710,47 @@ local function enforceSpaceResidence(plot)
     if not wantsSpaceResidence(plot) then
         state.spaceCommitted = false
         state.spaceDoorReady = false
-        state.spaceResidence = 'Off / not unlocked'
+        state.spaceResidence = 'Space-first disabled'
         return false
     end
     if portalReached(true) then
         state.spaceCommitted = true
         state.spaceDoorReady = true
         state.spaceResidence = 'Staying in Space'
-        return false -- Keep farming, but only within the Space world.
+        state.portalPriority = 'Space only'
+        return false
     end
-    if not state.spaceCommitted then
-        local entry = portalEntry(plot)
-        state.spaceDoorReady = entry ~= nil
-        if not entry then
-            state.spaceResidence = 'Waiting for visible blue doorway'
-            return false -- Not ready yet: continue ordinary ground progression.
-        end
-        state.spaceCommitted = true -- Never let ground purchases pull us back.
-        state.spaceResidence = 'Door ready; entering Space'
+    -- Check the live door FIRST. The original loop incorrectly returned
+    -- immediately if SpaceZoneActive was not exactly boolean true.
+    local door = portalEntry(plot)
+    local ready = spaceUnlocked(plot, door)
+    state.spaceDoorReady = door ~= nil
+    if not ready and not state.spaceCommitted then
+        state.spaceResidence = 'Waiting for Space unlock'
+        state.portalPriority = 'Ground while locked'
+        return false
+    end
+    state.spaceCommitted = true
+    state.portalPriority = 'Portal entry (ground paused)'
+    if not door then
+        state.spaceResidence = 'Space ready; locating live blue doorway'
+        status('Space unlocked: searching for the blue SPACE BASE entrance ('..state.portalCandidates..' candidates)')
+        return true
     end
     if os.clock() < state.portalRetryAfter then
-        state.spaceResidence = 'Waiting for portal retry'
-        status('SPACE BASE door retry in '..math.ceil(state.portalRetryAfter - os.clock())..'s')
-        return true -- Pause ground actions, not the portal retry logic.
+        state.spaceResidence = 'Portal retry cooldown'
+        status('Space is top priority: retry doorway in '..math.ceil(state.portalRetryAfter - os.clock())..'s')
+        return true
     end
     state.spaceResidence = 'Entering Space'
+    state.portalPhase = 'Walking through blue door'
     if useSpacePortal(true) then
         state.spaceResidence = 'Staying in Space'
+        state.portalPriority = 'Space only'
     else
-        state.spaceResidence = 'Waiting for portal retry'
+        state.spaceResidence = 'Retrying blue doorway'
     end
-    return true -- One serialized portal attempt per controller cycle.
+    return true
 end
 
 local Wash = RS:WaitForChild('Wash', 20)
@@ -1324,7 +1376,7 @@ local function slotReady(slot, pad, groupName)
             local plot = slot.Parent and slot.Parent.Parent
             local zoneActive = plot and plot:GetAttribute('SpaceZoneActive') == true
             local isZonePad = slot.Name == 'Zone' or slot.Name == 'Floor'
-            if not zoneActive and not isZonePad then return false end
+            if not zoneActive and not state.spaceCommitted and not isZonePad then return false end
             if (label:find('upgrade',1,true) or label:find('decor',1,true))
                and tonumber(slot.Name) and slot:GetAttribute('Active') ~= true then return false end
             local stage = tonumber(pad:GetAttribute('Stage')) or select(1, spacePadStep(pad))
@@ -1758,7 +1810,7 @@ task.spawn(function()
             if os.clock() - lastUi > .6 then
                 lastUi = os.clock()
                 if statusLabel then statusLabel:Set(state.status) end
-                if detailLabel then detailLabel:Set('Cash '..money(cash())..' | '..state.bought..' buys | '..state.sprays..' sprays | '..state.bonuses..' bonuses | '..state.availablePurchasePads..' buyable | Boats '..state.boatBuys..' buys / '..state.boatSprays..' sprays | Planes '..state.planeBuys..' buys / '..state.planeSprays..' sprays | Space '..state.spaceBuys..' buys / '..state.spaceSprays..' sprays | Portal '..state.spaceResidence..' | Trips '..state.portalTrips..' / '..state.portalFailures..' fails') end
+                if detailLabel then detailLabel:Set('Cash '..money(cash())..' | '..state.bought..' buys | '..state.sprays..' sprays | '..state.bonuses..' bonuses | '..state.availablePurchasePads..' buyable | Boats '..state.boatBuys..' buys / '..state.boatSprays..' sprays | Planes '..state.planeBuys..' buys / '..state.planeSprays..' sprays | Space '..state.spaceBuys..' buys / '..state.spaceSprays..' sprays | Portal '..state.spaceResidence..' | Priority '..state.portalPriority..' | Trips '..state.portalTrips..' / '..state.portalFailures..' fails') end
             end
             local nowCash = cash()
             if nowCash ~= state.lastCash then
@@ -1775,6 +1827,8 @@ task.spawn(function()
                 state.spaceCommitted = false -- Reset on plot ownership changes.
                 state.spaceDoorReady = false
                 state.spaceResidence = 'Checking door'
+                state.portalScanAt = 0
+                state.portalScanResult = nil
             end
             local _, root = character()
             if not root then status('Respawning'); task.wait(.5); return end
@@ -1789,8 +1843,16 @@ task.spawn(function()
                 local candidates = purchaseCandidates(plot)
                 if #candidates>0 and buyPad(candidates[1]) then task.wait(.2); return end
             end
-            if settings.personal and buyPersonal(plot) then task.wait(.22); return end
-            if settings.wash and doWash(plot) then task.wait(.06); return end
+            -- Once Space residence is committed, finish spacecraft washing
+            -- ahead of optional personal upgrades. A steady stream of cheap
+            -- Income purchases must never starve spacecraft cleaning.
+            if spaceOnlyTargets(plot) then
+                if settings.wash and doWash(plot) then task.wait(.06); return end
+                if settings.personal and buyPersonal(plot) then task.wait(.22); return end
+            else
+                if settings.personal and buyPersonal(plot) then task.wait(.22); return end
+                if settings.wash and doWash(plot) then task.wait(.06); return end
+            end
             if settings.autoRecover and os.clock() - state.lastAction > 25 then
                 -- Discard transient target backoffs and revisit stations when stream-in finishes.
                 vehicleBackoff = setmetatable({}, {__mode='k'})
@@ -1813,4 +1875,4 @@ task.spawn(function()
     end
 end)
 
-PuckUI:Notify({Title='Wash the Car v1.9',Content='Walks through the blue SPACE BASE door using Humanoid movement, verifies teleport, then stays in Space.',Duration=5})
+PuckUI:Notify({Title='Wash the Car v1.10',Content='Space portal is the top priority: enter through the live blue door, pause ground farming and stay in Space.',Duration=5})
