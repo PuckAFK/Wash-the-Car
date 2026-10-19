@@ -1,10 +1,12 @@
 --[[
-    PuckAFK | Wash the Car | Smart Autofarm v1.3
+    PuckAFK | Wash the Car | Smart Autofarm v1.4
     Place 70733580049633
     Audited against the supplied 2026-10-19 .rbxl and network log.
 
     Smart tycoon purchases, legitimate client-side dirt erasing, native-format
     spray batching, free bonuses, player upgrades, offline claim and smooth travel.
+    v1.4: in-bay car guard, moving-vehicle rejection, fast high-coverage boat sprays,
+    calibrated sparse-mesh sampling and avoidance of off-map travel.
     v1.3: new boat berth upgrade chain, waterline-aware deep hull rays,
     mobile boat targeting, boat-specific purchase verification, and cleanable
     surface sampling for ships with large bounding boxes.
@@ -50,7 +52,8 @@ local settings = {
     purchaseUpgrades = true, purchaseStations = true, ignorePlaceholders = true,
     washPrioritization = true, fastTips = true, wealthyZonePriority = true,
     boatWash = true, boatPurchases = true, boatFocus = true,
-    boatSpacing = 1.6, boatMoveGrace = 0.4,
+    boatSpacing = 2.8, boatMoveGrace = 0.4,
+    carBayRadius = 82, boatRayBudget = 105, fastBoatWash = true,
 }
 local state = {
     status = 'Starting', plot = nil, target = nil, currentTween = nil,
@@ -63,6 +66,7 @@ local state = {
     lastVehicleScan = 0, scanCache = nil, lastPurchaseScan = 0, purchaseCache = {},
     foundPurchasePads = 0, availablePurchasePads = 0, lastPurchaseName = 'None',
     boatsDetected = 0, boatSprays = 0, boatBuys = 0,
+    carsOutOfRange = 0, boatRayHits = 0,
 }
 local cleanCursor = setmetatable({}, {__mode = 'k'})
 local faceBlocked = setmetatable({}, {__mode = 'k'})
@@ -130,17 +134,46 @@ local function ownPlot()
     end
     state.plot = nil
 end
+-- Station guard: an arriving car may live under our plot while its animator
+-- has already placed its mesh hundreds of studs down the road. Spot is the
+-- car bay's fixed anchor, not the moving vehicle's position.
+local function baySpot(model)
+    local slot = model and model.Parent
+    if not slot or not slot.Parent or slot.Parent.Name ~= 'Slots' then return nil end
+    local spot = slot:FindFirstChild('Spot')
+    if spot and spot:IsA('BasePart') then return spot.Position end
+    if spot and spot:IsA('Model') then return spot:GetPivot().Position end
+    return nil
+end
+local function carAtBay(model)
+    local anchor = baySpot(model)
+    if not anchor then return true end -- don't discard unrelated helicopter/plane zones
+    local root = model:FindFirstChild('AnimRoot') or model.PrimaryPart
+    if not root or not root:IsA('BasePart') then return false end
+    local diff = root.Position - anchor
+    return Vector3.new(diff.X,0,diff.Z).Magnitude <= math.clamp(settings.carBayRadius,45,115)
+       and math.abs(diff.Y) <= 48
+end
+local function animationSettled(model)
+    if model:GetAttribute('WashOpen') ~= true then return false end
+    local start = model:GetAttribute('MoveStart')
+    local duration = model:GetAttribute('MoveDuration')
+    if type(start) == 'number' and type(duration) == 'number' and duration > 0 then
+        local now = WS:GetServerTimeNow()
+        if now >= start and now < start + duration + 0.65 then return false end
+    end
+    -- Boat-specific modes; leaving vehicles never make useful wash targets.
+    local mode = model:GetAttribute('BoatMode')
+    if mode == 'Leave' or mode == 'Depart' then return false end
+    return true
+end
 local function isBoatVehicle(model, plot)
     if not model or not plot then return false end
     local group = plot:FindFirstChild('BoatSlots')
     return group ~= nil and model:IsDescendantOf(group)
 end
 local function boatReady(model)
-    -- Boats travel into their berths with an animated server pose. The boat's
-    -- cleanable MeshPart may be far from the dock while it is arriving.
-    if not model or model:GetAttribute('WashOpen') ~= true then return false end
-    local mode = model:GetAttribute('BoatMode')
-    if mode == 'Leave' then return false end
+    if not animationSettled(model) then return false end
     local start = model:GetAttribute('MoveStart')
     local duration = model:GetAttribute('MoveDuration')
     if type(start) == 'number' and type(duration) == 'number' and duration > 0 then
@@ -341,7 +374,9 @@ local function chooseVehicle(plot)
             local model = vehicleOf(part, plot)
             local boat = model and isBoatVehicle(model, plot)
             if model and (not boat or settings.boatWash)
+               and animationSettled(model)
                and (not boat or boatReady(model))
+               and carAtBay(model)
                and (vehicleBackoff[model] or 0) < os.clock() then
                 local count = pendingFaces(part)
                 if count > 0 then
@@ -452,7 +487,9 @@ end
 local function faceRay(part, face, index, isBoat)
     local n, u, v, depth, lenU, lenV = geometry(part, face)
     if not n then return end
-    local spacing = isBoat and math.clamp(settings.boatSpacing, 0.8, 3) or 2.5
+    -- Larger spacing prevents repeatedly washing the same tiny patch of a
+    -- large yacht/sail hull. Actual ray hits still gate every spray.
+    local spacing = isBoat and math.clamp(settings.boatSpacing, 1.4, 6) or 2.5
     local cols = math.clamp(math.ceil(lenU / spacing), 1, isBoat and 128 or 32)
     local rows = math.clamp(math.ceil(lenV / spacing), 1, isBoat and 128 or 32)
     local total = cols * rows
@@ -482,7 +519,9 @@ local function faceRay(part, face, index, isBoat)
     if hit.Normal:Dot(worldNormal) < 0.02 then return nil, total end
     return hit, total, facePoint, worldNormal
 end
-local function ensureNear(part, face, isBoat, hitPoint, hitNormal)
+local function ensureNear(part, face, isBoat, hitPoint, hitNormal, model)
+    if model and not animationSettled(model) then return false end
+    if model and not carAtBay(model) then return false end
     local _, root = character()
     if not root then return false end
     local n, _, _, depth = geometry(part, face)
@@ -500,6 +539,14 @@ local function ensureNear(part, face, isBoat, hitPoint, hitNormal)
         near = part.Position + part.CFrame.RightVector * 10 + Vector3.new(0,-2,0)
     end
     local reach = isBoat and 30 or 31
+    if model then
+        local spot = baySpot(model)
+        if spot then
+            local d = near - spot
+            if Vector3.new(d.X,0,d.Z).Magnitude > settings.carBayRadius + 27
+               or math.abs(d.Y) > 55 then return false end
+        end
+    end
     if (root.Position - approach).Magnitude > reach then
         status('Moving to ' .. (isBoat and 'boat hull ' or '') .. face .. ' surface')
         if not tweenTo(near, approach, 25) then return false end
@@ -523,6 +570,7 @@ end
 local function sprayBatch(part, face, model, plot)
     if not WashEvent then return false end
     if not validSprayPart(part,model,plot) or doneFace(part,face) then return false end
+    if not animationSettled(model) or not carAtBay(model) then return false end
     local isBoat = isBoatVehicle(model, plot)
     if isBoat and (not settings.boatWash or not boatReady(model)) then return false end
     local cursorMap = cleanCursor[part] or {}
@@ -530,30 +578,37 @@ local function sprayBatch(part, face, model, plot)
     local startIndex = cursorMap[face] or 1
     local records, attempts = {}, 0
     local maxPoints = math.clamp(math.floor(settings.batchSize), 1, 30)
+    if isBoat and settings.fastBoatWash then maxPoints = math.max(maxPoints, 25) end
+    local scanBudget = isBoat and math.clamp(settings.boatRayBudget, 30, 170) or maxPoints
     local span = brushSize()
     local _, faceAxis = geometry(part, face)
     local sweepAxis = part.CFrame:VectorToWorldSpace(faceAxis)
     local swept, lastTotal, firstHit = 0, 0, nil
+    local maxRecordCount = isBoat and 30 or maxPoints
+    local farHit, farIndex, farDistance
+    local sprayRange = (PowerWashConfig and tonumber(PowerWashConfig.SprayRange) or 40) - 3
     -- Find real above-water hull geometry BEFORE travelling. An empty bounding
     -- box point can be many studs away from the actual ship surface.
     if isBoat then
-        for i = 0, 23 do
+        for i = 0, (isBoat and settings.fastBoatWash and 55 or 23) do
             local hit = faceRay(part, face, startIndex+i, true)
             if hit then firstHit = hit; swept = i; break end
         end
         if not firstHit then
-            cursorMap[face] = startIndex + 24
+            cursorMap[face] = startIndex + (isBoat and settings.fastBoatWash and 56 or 24)
             faceBlocked[part] = faceBlocked[part] or {}
-            faceBlocked[part][face] = os.clock() + 2
+            faceBlocked[part][face] = os.clock() + 1.2
             return false
         end
-        if not ensureNear(part,face,true,firstHit.Position,firstHit.Normal) then
+        if not ensureNear(part,face,true,firstHit.Position,firstHit.Normal,model) then
             return false
         end
-    elseif not ensureNear(part,face,false) then
+    elseif not ensureNear(part,face,false,nil,nil,model) then
         return false
     end
-    while attempts < maxPoints and alive and validSprayPart(part,model,plot) do
+    while attempts < scanBudget and #records < maxRecordCount and alive
+       and validSprayPart(part,model,plot) do
+        if not animationSettled(model) or not carAtBay(model) then break end
         if isBoat and not boatReady(model) then break end
         local hit, total
         if firstHit then
@@ -563,7 +618,21 @@ local function sprayBatch(part, face, model, plot)
             hit,total = faceRay(part,face,startIndex+swept,isBoat)
         end
         lastTotal = total or lastTotal
+        local rayIndex = startIndex + swept
         swept += 1
+        if hit and isBoat then
+            -- On a very large yacht/sail hull, hits from the same bounding box
+            -- can be >40 studs from the player. The server rejects them. Don't
+            -- count/re-send those; remember an actual valid surface to move to.
+            local _, sprayRoot = character()
+            local dist = sprayRoot and (sprayRoot.Position - hit.Position).Magnitude or math.huge
+            if dist > sprayRange then
+                if not farHit or dist < farDistance then
+                    farHit, farIndex, farDistance = hit, rayIndex, dist
+                end
+                hit = nil
+            end
+        end
         if hit then
             local affected, primary, faceList
             if CleanableManager and type(CleanableManager.eraseAt) == 'function' then
@@ -572,12 +641,12 @@ local function sprayBatch(part, face, model, plot)
             end
             if affected and type(faceList) == 'table' then
                 for _, f in ipairs(faceList) do
-                    if #records < 30 and not doneFace(affected,f) then
+                    if #records < maxRecordCount and not doneFace(affected,f) then
                         table.insert(records, {p=affected, f=f, pos=hit.Position})
                     end
                 end
             elseif not CleanableManager then
-                if #records < 30 then
+                if #records < maxRecordCount then
                     table.insert(records, {p=part, f=face, pos=hit.Position})
                 end
             end
@@ -587,15 +656,27 @@ local function sprayBatch(part, face, model, plot)
     end
     cursorMap[face] = startIndex + swept
     if #records == 0 then
+        if isBoat and farHit then
+            -- No accepted local hull rays: relocate to the nearest observed
+            -- reachable hull section. Retry from its actual sample index.
+            cursorMap[face] = farIndex
+            if ensureNear(part,face,true,farHit.Position,farHit.Normal,model) then
+                status('Repositioned beside a new boat hull section')
+            end
+            return false
+        end
         faceBlocked[part] = faceBlocked[part] or {}
-        faceBlocked[part][face] = os.clock() + (isBoat and 2.5 or 5)
+        faceBlocked[part][face] = os.clock() + (isBoat and 1.2 or 5)
         return false
     end
     local now = os.clock()
-    if now - state.lastWash < settings.washInterval then
-        waitActive(settings.washInterval - (now-state.lastWash))
+    local interval = isBoat and settings.fastBoatWash and math.min(settings.washInterval,0.12)
+                     or settings.washInterval
+    if now - state.lastWash < interval then
+        waitActive(interval - (now-state.lastWash))
     end
-    if not alive or (isBoat and not boatReady(model)) then return false end
+    if not alive or not animationSettled(model) or not carAtBay(model)
+       or (isBoat and not boatReady(model)) then return false end
     state.lastWash = os.clock()
     local ok = pcall(WashEvent.FireServer, WashEvent, 'reportSpray', records, sweepAxis)
     if ok then
@@ -631,7 +712,9 @@ local function doWash(plot)
         return false
     end
     local didSomething = false
-    local stampLimit = 6  -- re-evaluate purchases & bonuses regularly
+    local stampLimit = picked.isBoat and settings.fastBoatWash and 9 or 6
+    -- Boat runs get more active spray batches per decision, but all sprays
+    -- remain serialized and paced; buyers/free bonuses are still revisited.
     local fired = 0
     for _, part in ipairs(picked.parts) do
         if not alive or not settings.master or not settings.wash then break end
@@ -1033,6 +1116,7 @@ options:CreateSection('Boat docks')
 options:CreateToggle({Name='Wash Boats & Yachts',CurrentValue=settings.boatWash,Callback=function(v) settings.boatWash=v end})
 options:CreateToggle({Name='Buy Boat Berths & Equipment',CurrentValue=settings.boatPurchases,Callback=function(v) settings.boatPurchases=v end})
 options:CreateToggle({Name='Focus Boat Progression',CurrentValue=settings.boatFocus,Callback=function(v) settings.boatFocus=v end})
+options:CreateToggle({Name='Fast Boat / Sailboat Cleaning',CurrentValue=settings.fastBoatWash,Callback=function(v) settings.fastBoatWash=v end})
 options:CreateSection('Expansion')
 options:CreateToggle({Name='Unlock New Zones',CurrentValue=settings.zones,Callback=function(v) settings.zones=v end})
 options:CreateToggle({Name='Buy Decorations',CurrentValue=settings.decorations,Callback=function(v) settings.decorations=v end})
@@ -1051,7 +1135,9 @@ advanced:CreateSlider({Name='Tween Speed',Range={40,250},Increment=5,CurrentValu
 advanced:CreateSlider({Name='Spray Delay',Range={0.12,0.40},Increment=0.01,CurrentValue=settings.washInterval,Suffix='s',Callback=function(v) settings.washInterval=v end})
 advanced:CreateSlider({Name='Wash Batch Size',Range={4,25},Increment=1,CurrentValue=settings.batchSize,Callback=function(v) settings.batchSize=v end})
 advanced:CreateSlider({Name='Washing Distance',Range={10,22},Increment=1,CurrentValue=settings.distance,Suffix=' studs',Callback=function(v) settings.distance=v end})
-advanced:CreateSlider({Name='Boat Hull Scan Spacing',Range={1,3},Increment=0.2,CurrentValue=settings.boatSpacing,Suffix=' studs',Callback=function(v) settings.boatSpacing=v end})
+advanced:CreateSlider({Name='Boat Hull Scan Spacing',Range={1.4,6},Increment=0.2,CurrentValue=settings.boatSpacing,Suffix=' studs',Callback=function(v) settings.boatSpacing=v end})
+advanced:CreateSlider({Name='Boat Scan Budget',Range={30,170},Increment=10,CurrentValue=settings.boatRayBudget,Suffix=' rays',Callback=function(v) settings.boatRayBudget=v end})
+advanced:CreateSlider({Name='Car Bay Safety Radius',Range={45,115},Increment=5,CurrentValue=settings.carBayRadius,Suffix=' studs',Callback=function(v) settings.carBayRadius=v end})
 advanced:CreateToggle({Name='Noclip During Tween Only',CurrentValue=settings.useNoclip,Callback=function(v) settings.useNoclip=v end})
 advanced:CreateToggle({Name='Automatic Stall Recovery',CurrentValue=settings.autoRecover,Callback=function(v) settings.autoRecover=v end})
 advanced:CreateToggle({Name='Anti AFK',CurrentValue=settings.antiAfk,Callback=function(v) settings.antiAfk=v end})
@@ -1115,4 +1201,4 @@ task.spawn(function()
     end
 end)
 
-PuckUI:Notify({Title='Wash the Car v1.3',Content='Boat hull washing and berth purchases improved; deep raycasts, waterline filtering and boat controls.',Duration=5})
+PuckUI:Notify({Title='Wash the Car v1.4',Content='No off-map car chasing; faster large-boat and sailboat cleaning with safer targeting.',Duration=5})
