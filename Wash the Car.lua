@@ -1,10 +1,13 @@
 --[[
-    PuckAFK | Wash the Car | Smart Autofarm v1.8
+    PuckAFK | Wash the Car | Smart Autofarm v1.9
     Place 70733580049633
     Audited against the supplied 2026-10-19 .rbxl and network log.
 
     Smart tycoon purchases, legitimate client-side dirt erasing, native-format
     spray batching, free bonuses, player upgrades, offline claim and smooth travel.
+    v1.9: physically walk into the visible SPACE BASE blue doorway,
+    discover the live cyan portal even if PortalDoor.Boarding is empty,
+    verify the Space arrival, and remain there without ground detours.
     v1.8: auto-enter the blue door as soon as a live trigger is ready,
     commit to Space-only washing/purchasing and stay there through idle and
     respawns without returning to ground for older tycoon tasks.
@@ -438,11 +441,11 @@ local function tweenDirect(point, lookAt, maxTime)
     return alive and state.moveToken == token and newRoot and (newRoot.Position - point).Magnitude < 7
 end
 
--- Both halves of Space live in one Roblox place, but legitimate entry is
--- through the blue door by our own launch rocket, NOT a 4000-stud sky tween.
--- The recorded dump contains a PortalDoor model with an empty Boarding shell;
--- its actual trigger can be constructed only once the zone is activated.
--- Discover a live touch part each time, and fail safely when it has not loaded.
+-- Both halves of Space are in one Roblox place. The ground-to-Space
+-- transition is a physical WALK THROUGH the bright blue SPACE BASE doorway.
+-- The saved dump contains an EMPTY PortalDoor.Boarding model, even though
+-- the live rocket has a visible portal. Do not require a touchable BasePart
+-- inside Boarding: find the actual live cyan portal surface on our rocket.
 local function highWorld(position)
     return typeof(position) == 'Vector3' and position.Y > 2200
 end
@@ -450,23 +453,55 @@ local function portalEntry(plot)
     local decor = plot and plot:FindFirstChild('Decor')
     local rocket = decor and decor:FindFirstChild('SpaceRocket')
     local door = rocket and rocket:FindFirstChild('PortalDoor')
-    if not door then return nil end
+    if not rocket or not rocket:IsDescendantOf(WS) then return nil end
+
     local best, bestScore
-    for _, item in ipairs(door:GetDescendants()) do
-        if item:IsA('BasePart') and item:IsDescendantOf(WS)
-           and item.CanTouch and not paidAncestor(item) then
-            local label = item.Name:lower()
-            local score = 0
-            if label:find('touch',1,true) or label:find('trigger',1,true) then score += 100 end
-            if label:find('portal',1,true) or label:find('teleport',1,true) then score += 80 end
-            if label:find('door',1,true) or label:find('entry',1,true)
-               or label:find('enter',1,true) then score += 55 end
-            if item.Color.B > item.Color.R + 0.18 and item.Color.B > item.Color.G * 0.72 then score += 12 end
-            if label:find('frame',1,true) or label:find('sign',1,true) then score -= 45 end
-            if not best or score > bestScore then best,bestScore = item,score end
+    local function consider(part, inDoor)
+        if not part:IsA('BasePart') or not part:IsDescendantOf(WS)
+           or paidAncestor(part) then return end
+        local label = part.Name:lower()
+        local blue = part.Color.B > 0.70 and part.Color.G > 0.56
+                     and part.Color.B > part.Color.R * 1.33
+                     and part.Color.G > part.Color.R * 1.30
+        local named = label:find('portal',1,true) or label:find('door',1,true)
+            or label:find('enter',1,true) or label:find('boarding',1,true)
+            or label:find('teleport',1,true) or label:find('horizon',1,true)
+            or label:find('touch',1,true) or label:find('trigger',1,true)
+        -- Without an actual doorway-like visual or relevant part name we must
+        -- not select random cyan rocket lights, launch rails or decorations.
+        if not (inDoor or named or (blue and part.Size.Y >= 5 and part.Size.X >= 3)) then return end
+        local score = 0
+        if inDoor then score += 100 end
+        if blue then score += 95 end
+        if part.Material == Enum.Material.Neon and blue then score += 22 end
+        if label:find('portal',1,true) or label:find('enter',1,true) then score += 80 end
+        if label:find('touch',1,true) or label:find('trigger',1,true) then score += 40 end
+        if label:find('boarding',1,true) or label:find('door',1,true) then score += 28 end
+        if part.Size.Y >= 6 and part.Size.Y <= 30 then score += 15 end
+        if part.CanTouch then score += 12 end
+        if label:find('frame',1,true) or label:find('sign',1,true)
+           or label:find('light',1,true) or label:find('rail',1,true)
+           or label:find('trim',1,true) then score -= 115 end
+        -- Prioritize the real opening over rocket trim. Do not use a physical
+        -- touch trigger only because it is first in GetDescendants order.
+        if score > (bestScore or -math.huge) then
+            best, bestScore = part, score
         end
     end
-    return best
+    if door then
+        for _, part in ipairs(door:GetDescendants()) do
+            consider(part, true)
+        end
+    end
+    -- The real visible entrance may be generated as a sibling of PortalDoor
+    -- or placed under Rocket/LaunchTower after purchasing the door.
+    if not best or (bestScore or 0) < 155 then
+        for _, part in ipairs(rocket:GetDescendants()) do
+            consider(part, door ~= nil and part:IsDescendantOf(door))
+        end
+    end
+    if best and (bestScore or 0) >= 100 then return best end
+    return nil
 end
 local function portalExit()
     local world = WS:FindFirstChild('SpaceWorld')
@@ -480,45 +515,91 @@ local function portalReached(spaceDestination)
     local _, r = character()
     return r ~= nil and highWorld(r.Position) == spaceDestination
 end
+-- Walk through the entrance using the Humanoid so the SERVER receives
+-- physical character contact. CFrame tweens alone may never fire Touched.
+local function walkBlueDoor(entry)
+    if not entry or not entry:IsA('BasePart') then return false end
+    local _, root, humanoid = character()
+    if not root or not humanoid or humanoid.Health <= 0 then return false end
+
+    local center = entry.Position
+    -- A portal is normally a thin upright panel. Its thinnest horizontal
+    -- dimension indicates the side from which to walk through the doorway.
+    local axis = (entry.Size.X < entry.Size.Z)
+        and entry.CFrame.RightVector or entry.CFrame.LookVector
+    axis = Vector3.new(axis.X,0,axis.Z)
+    if axis.Magnitude < 0.05 then return false end
+    axis = axis.Unit
+    local frontSign = (root.Position - center):Dot(axis) >= 0 and 1 or -1
+    local portalBottom = center.Y - entry.Size.Y * 0.5
+    local height = portalBottom + 3
+    -- For unusually thin visual triggers preserve the player platform height.
+    if entry.Size.Y < 5 then height = root.Position.Y end
+    local span = math.clamp(math.min(entry.Size.X,entry.Size.Z) * 0.5 + 5, 5, 9)
+    local from = Vector3.new(center.X, height, center.Z) + axis * frontSign * span
+    local through = Vector3.new(center.X, height, center.Z) - axis * frontSign * (span + 3)
+
+    -- Stage just outside the doorway with the existing smooth travel logic.
+    -- Even if the stage clips the trigger, verify teleport before proceeding.
+    status('Approaching the blue SPACE BASE doorway')
+    if (root.Position - from).Magnitude > 3.5 then
+        tweenDirect(from, center, 24)
+        if portalReached(true) then return true end
+    end
+    if not alive or not settings.master or not entry:IsDescendantOf(WS) then return false end
+    cancelTravel() -- Restore collisions: allow a real Humanoid contact event.
+    local _, liveRoot, liveHum = character()
+    if not liveRoot or not liveHum or liveHum.Health <= 0 then return false end
+    status('Walking through the blue SPACE BASE door')
+    state.portalPhase = 'Walking through doorway'
+    liveHum:MoveTo(through)
+    local deadline = os.clock() + 9
+    local lastPosition = liveRoot.Position
+    local stoppedAt = os.clock()
+    local jumped = false
+    while alive and settings.master and os.clock() < deadline do
+        if portalReached(true) then return true end
+        local _, nowRoot, nowHum = character()
+        if nowRoot ~= liveRoot or not nowRoot or not nowRoot.Parent
+           or not nowHum or nowHum.Health <= 0 then break end
+        if (nowRoot.Position - lastPosition).Magnitude > 1 then
+            lastPosition = nowRoot.Position
+            stoppedAt = os.clock()
+        elseif not jumped and os.clock() - stoppedAt > 1.3 then
+            nowHum.Jump = true
+            jumped = true
+        elseif os.clock() - stoppedAt > 3.5 then
+            break
+        end
+        if (nowRoot.Position - through).Magnitude < 2.5 then break end
+        task.wait(0.09)
+    end
+    return portalReached(true)
+end
+
 local function activatePortal(trigger, spaceDestination)
-    if not (trigger and trigger.Parent and trigger:IsDescendantOf(WS) and trigger.CanTouch) then return false end
-    for side = 1, 2 do
-        if portalReached(spaceDestination) then return true end
-        local _, root = character()
-        if not root then return false end
-        local facing = Vector3.new(trigger.CFrame.LookVector.X, 0, trigger.CFrame.LookVector.Z)
-        if facing.Magnitude < 0.01 then facing = Vector3.new(0,0,1) end
-        facing = facing.Unit
-        local ahead = trigger.Position + facing * (side == 1 and -4 or 4)
-        local doorway = trigger.Position + Vector3.new(0, math.clamp(trigger.Size.Y*.08,0.2,2),0)
-        local near = Vector3.new(ahead.X,doorway.Y,ahead.Z)
-        if (root.Position - near).Magnitude > 4 then
-            tweenDirect(near, doorway, 20)
-            if portalReached(spaceDestination) then return true end
-        end
-        if not alive or not settings.master then return false end
-        state.portalPhase = spaceDestination and 'Entering Space' or 'Returning to plot'
-        status((spaceDestination and 'Entering blue Space door' or 'Using Space return portal') .. ' ('..side..'/2)')
-        -- Walk through the actual touch part: no teleport/zone remote guessing.
-        tweenDirect(doorway + facing * (side == 1 and 3 or -3), doorway, 8)
-        if portalReached(spaceDestination) then return true end
-        local _, touchingRoot = character()
-        if touchingRoot and (touchingRoot.Position-trigger.Position).Magnitude < 15 then
-            if type(firetouchinterest) == 'function' then
-                pcall(firetouchinterest, touchingRoot, trigger, 0)
-                waitActive(0.12)
-                pcall(firetouchinterest, touchingRoot, trigger, 1)
-            end
-            local prompt = trigger:FindFirstChildWhichIsA('ProximityPrompt', true)
-            if prompt and prompt.Enabled and type(fireproximityprompt) == 'function' then
-                pcall(fireproximityprompt, prompt)
-            end
-        end
-        local untilTime = os.clock() + 3.8
-        while alive and settings.master and os.clock() < untilTime do
-            if portalReached(spaceDestination) then return true end
-            task.wait(0.12)
-        end
+    if not (trigger and trigger.Parent and trigger:IsDescendantOf(WS)) then return false end
+    if spaceDestination then
+        -- First try from the player's current side; if the portal is mounted
+        -- backwards, approach from the opposite side on the next attempt.
+        return walkBlueDoor(trigger)
+    end
+    -- Return portal still has a real ReturnTouch physical trigger.
+    if not trigger:IsA('BasePart') or not trigger.CanTouch then return false end
+    local _, root, hum = character()
+    if not root then return false end
+    local p = trigger.Position + Vector3.new(0,2,0)
+    tweenDirect(p,trigger.Position,20)
+    if portalReached(false) then return true end
+    cancelTravel()
+    local _, touchRoot, touchHum = character()
+    if touchRoot and touchHum and touchHum.Health > 0 then
+        touchHum:MoveTo(trigger.Position)
+    end
+    local deadline = os.clock() + 4
+    while alive and settings.master and os.clock() < deadline do
+        if portalReached(false) then return true end
+        task.wait(0.10)
     end
     return false
 end
@@ -535,7 +616,7 @@ local function useSpacePortal(spaceDestination)
     end
     local trigger = spaceDestination and portalEntry(plot) or portalExit()
     if not trigger then
-        status(spaceDestination and 'Blue Space door not loaded yet' or 'ReturnTouch portal not loaded yet')
+        status(spaceDestination and 'Waiting for live blue SPACE BASE doorway' or 'ReturnTouch portal not loaded yet')
         state.portalRetryAfter = os.clock() + 7
         return false
     end
@@ -551,7 +632,7 @@ local function useSpacePortal(spaceDestination)
     state.portalFailures += 1
     state.portalPhase = 'Retry pending'
     state.portalRetryAfter = os.clock() + 12
-    status('Blue-door portal did not move player; retrying after cooldown')
+    status('Door crossing not confirmed; retrying after cooldown')
     return false
 end
 local function tweenTo(point, lookAt, maxTime)
@@ -573,9 +654,9 @@ local function tweenTo(point, lookAt, maxTime)
 end
 
 -- Space is a progression phase, not simply another scored destination.
--- Door readiness must be grounded in BOTH the player's replicated unlock and
--- a real, touchable trigger constructed in the live PortalDoor. The saved
--- place dump only has an empty Boarding placeholder until runtime.
+-- Door readiness uses the actual replicated Space unlock AND a visible
+-- portal part generated on the live rocket. Saved PortalDoor.Boarding is empty;
+-- a real Humanoid crossing can activate the destination's server touch sensor.
 local function wantsSpaceResidence(plot)
     return settings.autoEnterAndStaySpace and settings.useSpaceDoor and plot
        and (plot:GetAttribute('SpaceZoneActive') == true or state.spaceCommitted)
@@ -600,7 +681,7 @@ local function enforceSpaceResidence(plot)
         local entry = portalEntry(plot)
         state.spaceDoorReady = entry ~= nil
         if not entry then
-            state.spaceResidence = 'Waiting for blue door to activate'
+            state.spaceResidence = 'Waiting for visible blue doorway'
             return false -- Not ready yet: continue ordinary ground progression.
         end
         state.spaceCommitted = true -- Never let ground purchases pull us back.
@@ -608,7 +689,7 @@ local function enforceSpaceResidence(plot)
     end
     if os.clock() < state.portalRetryAfter then
         state.spaceResidence = 'Waiting for portal retry'
-        status('Space door ready • retry in '..math.ceil(state.portalRetryAfter - os.clock())..'s')
+        status('SPACE BASE door retry in '..math.ceil(state.portalRetryAfter - os.clock())..'s')
         return true -- Pause ground actions, not the portal retry logic.
     end
     state.spaceResidence = 'Entering Space'
@@ -1732,4 +1813,4 @@ task.spawn(function()
     end
 end)
 
-PuckUI:Notify({Title='Wash the Car v1.8',Content='Automatically enter the unlocked blue door, stay in Space, and focus on Space-only progress.',Duration=5})
+PuckUI:Notify({Title='Wash the Car v1.9',Content='Walks through the blue SPACE BASE door using Humanoid movement, verifies teleport, then stays in Space.',Duration=5})
