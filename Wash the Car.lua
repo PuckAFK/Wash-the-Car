@@ -1,10 +1,13 @@
 --[[
-    PuckAFK | Wash the Car | Smart Autofarm v1.2
+    PuckAFK | Wash the Car | Smart Autofarm v1.3
     Place 70733580049633
     Audited against the supplied 2026-10-19 .rbxl and network log.
 
     Smart tycoon purchases, legitimate client-side dirt erasing, native-format
     spray batching, free bonuses, player upgrades, offline claim and smooth travel.
+    v1.3: new boat berth upgrade chain, waterline-aware deep hull rays,
+    mobile boat targeting, boat-specific purchase verification, and cleanable
+    surface sampling for ships with large bounding boxes.
     v1.2: dynamic named upgrade/decor pad recognition, placeholder filtering,
     richer multi-zone purchase planning, better purchase touch recovery.
     v1.1: dirt-progress scoring, real brush size, end-game ROI weighting,
@@ -46,6 +49,8 @@ local settings = {
     smartSpending = true, autoRecover = true, antiAfk = true,
     purchaseUpgrades = true, purchaseStations = true, ignorePlaceholders = true,
     washPrioritization = true, fastTips = true, wealthyZonePriority = true,
+    boatWash = true, boatPurchases = true, boatFocus = true,
+    boatSpacing = 1.6, boatMoveGrace = 0.4,
 }
 local state = {
     status = 'Starting', plot = nil, target = nil, currentTween = nil,
@@ -57,6 +62,7 @@ local state = {
     lastIncomeSample = os.clock(), cashAtSample = 0, incomePerMinute = 0,
     lastVehicleScan = 0, scanCache = nil, lastPurchaseScan = 0, purchaseCache = {},
     foundPurchasePads = 0, availablePurchasePads = 0, lastPurchaseName = 'None',
+    boatsDetected = 0, boatSprays = 0, boatBuys = 0,
 }
 local cleanCursor = setmetatable({}, {__mode = 'k'})
 local faceBlocked = setmetatable({}, {__mode = 'k'})
@@ -124,11 +130,32 @@ local function ownPlot()
     end
     state.plot = nil
 end
+local function isBoatVehicle(model, plot)
+    if not model or not plot then return false end
+    local group = plot:FindFirstChild('BoatSlots')
+    return group ~= nil and model:IsDescendantOf(group)
+end
+local function boatReady(model)
+    -- Boats travel into their berths with an animated server pose. The boat's
+    -- cleanable MeshPart may be far from the dock while it is arriving.
+    if not model or model:GetAttribute('WashOpen') ~= true then return false end
+    local mode = model:GetAttribute('BoatMode')
+    if mode == 'Leave' then return false end
+    local start = model:GetAttribute('MoveStart')
+    local duration = model:GetAttribute('MoveDuration')
+    if type(start) == 'number' and type(duration) == 'number' and duration > 0 then
+        local now = WS:GetServerTimeNow()
+        if now >= start and now < start + duration + settings.boatMoveGrace then
+            return false
+        end
+    end
+    return true
+end
 local function isOwnVehicle(model, plot)
     if not model or not model:IsA('Model') or not plot or not model:IsDescendantOf(plot) then return false end
     local node = model
     while node and node ~= plot do
-        if node:GetAttribute('WashOpen') ~= nil then
+        if node:GetAttribute('WashTotalFaces') ~= nil or node:GetAttribute('WashOpen') ~= nil then
             local uid = node:GetAttribute('OwnerUserId')
             return node:GetAttribute('WashOpen') == true and (uid == nil or uid == LP.UserId)
         end
@@ -139,7 +166,7 @@ end
 local function vehicleOf(part, plot)
     local node = part and part.Parent
     while node and node ~= plot do
-        if node:IsA('Model') and node:GetAttribute('WashOpen') ~= nil then
+        if node:IsA('Model') and (node:GetAttribute('WashTotalFaces') ~= nil or node:GetAttribute('WashOpen') ~= nil) then
             if isOwnVehicle(node, plot) then return node end
             return nil
         end
@@ -226,6 +253,9 @@ local CleanableManager = Wash and try('wash-module', function() return require(W
 local PowerWashConfig = Wash and try('wash-config', function() return require(Wash:WaitForChild('PowerWashConfig', 15)) end)
 local DirtSurface = Wash and try('surface-module', function() return require(Wash:WaitForChild('DirtSurface', 15)) end)
 local BrushUpgradeConfig = try('brush-config', function() return require(RS:WaitForChild('BrushUpgradeConfig', 15)) end)
+local BoatConfig = try('boat-config', function()
+    return require((RS:WaitForChild('Boats', 15)):WaitForChild('BoatConfig', 15))
+end)
 local CarPrices = try('car-prices', function() return require((RS:WaitForChild('Cars', 15)):WaitForChild('CarPrices',15)) end)
 local PurchaseTargets = try('purchase-targets', function() return require(RS:WaitForChild('PurchaseTargets', 15)) end)
 local UpgradesConfig = try('upgrade-config', function() return require(RS:WaitForChild('UpgradesConfig', 15)) end)
@@ -309,14 +339,17 @@ local function chooseVehicle(plot)
     for _, part in ipairs(CollectionService:GetTagged('Cleanable')) do
         if part:IsA('BasePart') and part:IsDescendantOf(plot) then
             local model = vehicleOf(part, plot)
-            if model and (vehicleBackoff[model] or 0) < os.clock() then
+            local boat = model and isBoatVehicle(model, plot)
+            if model and (not boat or settings.boatWash)
+               and (not boat or boatReady(model))
+               and (vehicleBackoff[model] or 0) < os.clock() then
                 local count = pendingFaces(part)
                 if count > 0 then
                     local data = cars[model]
                     if not data then
                         data = {model = model, parts = {}, faces = 0, equivalentFaces = 0,
                                 nearest = math.huge, pay = vehiclePay(model), progress = progress,
-                                liveProgress = 0, seen = 0, partsAmount = 0}
+                                liveProgress = 0, seen = 0, partsAmount = 0, isBoat = boat}
                         cars[model] = data
                     end
                     data.faces += count
@@ -355,7 +388,17 @@ local function chooseVehicle(plot)
         if settings.wealthyZonePriority then
             score += payoutRank * 2
         end
+        -- Boat pay scales are much larger than bay cars. Focus on finishing
+        -- eligible berths once the boat zone has been unlocked.
+        if data.isBoat and settings.boatFocus then
+            score += 28
+            if data.liveProgress > 0 then score += 6 end
+        end
         if not best or score > bestScore then best, bestScore = data, score end
+    end
+    state.boatsDetected = 0
+    for _, data in pairs(cars) do
+        if data.isBoat then state.boatsDetected += 1 end
     end
     if best then
         table.sort(best.parts, function(a,b)
@@ -383,30 +426,63 @@ local function geometry(part, face)
     local lengthV = (axisV:Abs()):Dot(s)
     return localNormal, axisU, axisV, depth, lengthU, lengthV
 end
-local function faceRay(part, face, index)
+-- Low discrepancy coverage reaches narrow, curved boat hull areas faster
+-- than walking the first row of a huge rectangular bounding box.
+local function radicalInverse(n, base)
+    local result, inv = 0, 1 / base
+    while n > 0 do
+        result += (n % base) * inv
+        n = math.floor(n / base)
+        inv /= base
+    end
+    return result
+end
+local function aboveBoatWaterline(part, hit)
+    local waterline = part:GetAttribute('DirtWaterline')
+    local up = part:GetAttribute('DirtUp')
+    if typeof(waterline) ~= 'Vector3' or typeof(up) ~= 'Vector3' or up.Magnitude < .01 then
+        return true
+    end
+    local worldLine = part.CFrame:PointToWorldSpace(waterline)
+    local worldUp = part.CFrame:VectorToWorldSpace(up.Unit)
+    -- DirtSurface._maskUnreachable applies these same waterline restrictions.
+    return (hit.Position - worldLine):Dot(worldUp) > .05
+           and hit.Normal:Dot(worldUp) > -.75
+end
+local function faceRay(part, face, index, isBoat)
     local n, u, v, depth, lenU, lenV = geometry(part, face)
     if not n then return end
-    local spacing = 2.5
-    local cols = math.clamp(math.ceil(lenU / spacing), 1, 32)
-    local rows = math.clamp(math.ceil(lenV / spacing), 1, 32)
+    local spacing = isBoat and math.clamp(settings.boatSpacing, 0.8, 3) or 2.5
+    local cols = math.clamp(math.ceil(lenU / spacing), 1, isBoat and 128 or 32)
+    local rows = math.clamp(math.ceil(lenV / spacing), 1, isBoat and 128 or 32)
     local total = cols * rows
-    local offset = (index - 1) % total
-    local x = offset % cols
-    local y = math.floor(offset / cols)
-    -- Rotate sampling start on alternate sweeps to find dirty texture patches.
-    local localOrigin = n * depth + u * (((x+0.5)/cols-0.5)*lenU*0.90)
-                          + v * (((y+0.5)/rows-0.5)*lenV*0.90)
+    local x, y
+    if isBoat then
+        x = radicalInverse(index, 2)
+        y = radicalInverse(index, 3)
+    else
+        local offset = (index - 1) % total
+        x = (offset % cols + .5) / cols
+        y = (math.floor(offset / cols) + .5) / rows
+    end
+    local localOrigin = n * depth + u * ((x - .5) * lenU * .97)
+                     + v * ((y - .5) * lenV * .97)
     local worldNormal = part.CFrame:VectorToWorldSpace(n)
     local facePoint = part.CFrame:PointToWorldSpace(localOrigin)
-    local origin = facePoint + worldNormal * 4
+    local origin = facePoint + worldNormal * 3
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Include
     params.FilterDescendantsInstances = {part}
-    local hit = WS:Raycast(origin, -worldNormal * 8, params)
-    if not hit or hit.Instance ~= part then return nil, total, facePoint, worldNormal end
+    -- The old 8-stud ray only reached 4 studs below the bounding box. Boats
+    -- are often hollow/curved meshes with surfaces far deeper than that.
+    local reach = isBoat and (2 * depth + 8) or math.max(8, depth * 2 + 6)
+    local hit = WS:Raycast(origin, -worldNormal * reach, params)
+    if not hit or hit.Instance ~= part then return nil, total end
+    if isBoat and not aboveBoatWaterline(part, hit) then return nil, total end
+    if hit.Normal:Dot(worldNormal) < 0.02 then return nil, total end
     return hit, total, facePoint, worldNormal
 end
-local function ensureNear(part, face)
+local function ensureNear(part, face, isBoat, hitPoint, hitNormal)
     local _, root = character()
     if not root then return false end
     local n, _, _, depth = geometry(part, face)
@@ -414,16 +490,23 @@ local function ensureNear(part, face)
     local worldNormal = part.CFrame:VectorToWorldSpace(n)
     local faceCenter = part.Position + worldNormal * depth
     local near = faceCenter + worldNormal * math.clamp(settings.distance, 9, 23)
-    if face == 'Bottom' then
+    local approach = faceCenter
+    if isBoat and typeof(hitPoint) == 'Vector3' and typeof(hitNormal) == 'Vector3' then
+        -- Follow the actual wetted hull, not the centre of its often oversized box.
+        approach = hitPoint
+        near = hitPoint + hitNormal.Unit * math.clamp(settings.distance, 10, 19)
+                      + Vector3.new(0, 3, 0)
+    elseif face == 'Bottom' then
         near = part.Position + part.CFrame.RightVector * 10 + Vector3.new(0,-2,0)
     end
-    if (root.Position - faceCenter).Magnitude > 31 then
-        status('Moving to ' .. face .. ' surface')
-        if not tweenTo(near, faceCenter, 25) then return false end
-        waitActive(0.5)
+    local reach = isBoat and 30 or 31
+    if (root.Position - approach).Magnitude > reach then
+        status('Moving to ' .. (isBoat and 'boat hull ' or '') .. face .. ' surface')
+        if not tweenTo(near, approach, 25) then return false end
+        waitActive(isBoat and 0.22 or 0.5)
     end
     local _, current = character()
-    return current ~= nil and (current.Position - faceCenter).Magnitude < 42
+    return current ~= nil and (current.Position - approach).Magnitude < (isBoat and 38 or 42)
 end
 local function validSprayPart(part, model, plot)
     return alive and part.Parent and model.Parent and model:IsDescendantOf(plot)
@@ -440,58 +523,86 @@ end
 local function sprayBatch(part, face, model, plot)
     if not WashEvent then return false end
     if not validSprayPart(part,model,plot) or doneFace(part,face) then return false end
-    if not ensureNear(part, face) then return false end
+    local isBoat = isBoatVehicle(model, plot)
+    if isBoat and (not settings.boatWash or not boatReady(model)) then return false end
     local cursorMap = cleanCursor[part] or {}
     cleanCursor[part] = cursorMap
     local startIndex = cursorMap[face] or 1
-    local records, attempts, maxPoints = {}, 0, math.clamp(math.floor(settings.batchSize), 1, 30)
+    local records, attempts = {}, 0
+    local maxPoints = math.clamp(math.floor(settings.batchSize), 1, 30)
     local span = brushSize()
     local _, faceAxis = geometry(part, face)
     local sweepAxis = part.CFrame:VectorToWorldSpace(faceAxis)
-    local swept = 0
-    local lastTotal = 0
+    local swept, lastTotal, firstHit = 0, 0, nil
+    -- Find real above-water hull geometry BEFORE travelling. An empty bounding
+    -- box point can be many studs away from the actual ship surface.
+    if isBoat then
+        for i = 0, 23 do
+            local hit = faceRay(part, face, startIndex+i, true)
+            if hit then firstHit = hit; swept = i; break end
+        end
+        if not firstHit then
+            cursorMap[face] = startIndex + 24
+            faceBlocked[part] = faceBlocked[part] or {}
+            faceBlocked[part][face] = os.clock() + 2
+            return false
+        end
+        if not ensureNear(part,face,true,firstHit.Position,firstHit.Normal) then
+            return false
+        end
+    elseif not ensureNear(part,face,false) then
+        return false
+    end
     while attempts < maxPoints and alive and validSprayPart(part,model,plot) do
-        local hit, total = faceRay(part, face, startIndex + swept)
+        if isBoat and not boatReady(model) then break end
+        local hit, total
+        if firstHit then
+            hit = firstHit
+            firstHit = nil
+        else
+            hit,total = faceRay(part,face,startIndex+swept,isBoat)
+        end
         lastTotal = total or lastTotal
         swept += 1
         if hit then
-            local p, primary, faceList
+            local affected, primary, faceList
             if CleanableManager and type(CleanableManager.eraseAt) == 'function' then
-                local okay, a, b, c = pcall(CleanableManager.eraseAt, hit, sweepAxis, span, math.max(0.7,span*0.9))
-                if okay then p,primary,faceList = a,b,c end
+                local okay, a, b, c = pcall(CleanableManager.eraseAt, hit, sweepAxis, span, math.max(.7,span*.9))
+                if okay then affected, primary, faceList = a, b, c end
             end
-            -- The native sprayer sends one record per affected face.
-            if p and type(faceList) == 'table' then
+            if affected and type(faceList) == 'table' then
                 for _, f in ipairs(faceList) do
-                    if #records < 30 then table.insert(records, {p=p, f=f, pos=hit.Position}) end
+                    if #records < 30 and not doneFace(affected,f) then
+                        table.insert(records, {p=affected, f=f, pos=hit.Position})
+                    end
                 end
-            else
-                -- Local surface data might not have streamed in yet. Wait for real
-                -- DirtSurface loading rather than guessing and flooding invalid events.
-                if not CleanableManager then
-                    if #records < 30 then table.insert(records, {p=part, f=face, pos=hit.Position}) end
+            elseif not CleanableManager then
+                if #records < 30 then
+                    table.insert(records, {p=part, f=face, pos=hit.Position})
                 end
             end
         end
         attempts += 1
-        if lastTotal > 0 and swept >= lastTotal then break end
+        if not isBoat and lastTotal > 0 and swept >= lastTotal then break end
     end
     cursorMap[face] = startIndex + swept
     if #records == 0 then
         faceBlocked[part] = faceBlocked[part] or {}
-        faceBlocked[part][face] = os.clock() + 5
+        faceBlocked[part][face] = os.clock() + (isBoat and 2.5 or 5)
         return false
     end
     local now = os.clock()
-    if now - state.lastWash < settings.washInterval then waitActive(settings.washInterval - (now-state.lastWash)) end
-    if not alive then return false end
+    if now - state.lastWash < settings.washInterval then
+        waitActive(settings.washInterval - (now-state.lastWash))
+    end
+    if not alive or (isBoat and not boatReady(model)) then return false end
     state.lastWash = os.clock()
-    -- Shape and cadence match the observed WashNet.fire('reportSpray', batch, upVector).
     local ok = pcall(WashEvent.FireServer, WashEvent, 'reportSpray', records, sweepAxis)
     if ok then
         state.sprays += 1
+        if isBoat then state.boatSprays += 1 end
         state.lastAction = os.clock()
-        status('Cleaning ' .. model.Name .. ' • ' .. face)
+        status('Cleaning ' .. (isBoat and 'boat ' or '') .. model.Name .. ' • ' .. face)
         return true
     end
     return false
@@ -587,6 +698,16 @@ local function livePad(pad)
     if not isEnabledPart(act) then return end
     return act, price
 end
+local function boatPadStep(pad)
+    if not BoatConfig or type(BoatConfig.Upgrades) ~= 'table' then return end
+    local name = string.lower(pad.Name)
+    for i, info in ipairs(BoatConfig.Upgrades) do
+        if name:find('upgrade',1,true) and type(info.id) == 'string'
+            and name:find(string.lower(info.id),1,true) then
+            return i, info
+        end
+    end
+end
 local function slotReady(slot, pad, groupName)
     if groupName == 'Slots' then
         local stage = tonumber(pad:GetAttribute('Stage'))
@@ -595,11 +716,20 @@ local function slotReady(slot, pad, groupName)
         if pad.Name == 'UpgradeButton' and (not stage or stage ~= level + 1) then return false end
         if pad.Name == 'DecorButton' and level < 1 then return false end
     else
-        -- Station upgrades require that their station be unlocked first.
-        -- Future zones may place decorative pads under the area itself.
         local label = string.lower(pad.Name)
         if label:find('upgrade',1,true) and tonumber(slot.Name) then
             if slot:GetAttribute('Active') ~= true then return false end
+        end
+        if groupName == 'BoatSlots' then
+            -- A boat upgrade has to belong to an active berth. Use the boat
+            -- config to identify the actual upgrade stage, but trust live
+            -- Locked/Price/Activate state over speculative wash counters.
+            if label:find('upgrade',1,true) and slot:GetAttribute('Active') ~= true then
+                return false
+            end
+            local stage = tonumber(pad:GetAttribute('Stage'))
+            local bought = tonumber(slot:GetAttribute('UpgradesDone'))
+            if stage and bought and stage <= bought then return false end
         end
     end
     return true
@@ -635,7 +765,8 @@ local function purchaseCandidates(plot)
                             if act then
                                 discovered += 1
                                 local kind, equipment = padIdentity(pad,slot,groupName)
-                                if kind and (buttonBackoff[pad] or 0) <= os.clock()
+                                if kind and (groupName ~= 'BoatSlots' or settings.boatPurchases)
+                                  and (buttonBackoff[pad] or 0) <= os.clock()
                                   and (groupName ~= 'Slots' or not originalBayPads or originalBayPads[pad])
                                   and slotReady(slot,pad,groupName)
                                   and (kind ~= 'Decoration' or settings.decorations)
@@ -650,8 +781,23 @@ local function purchaseCandidates(plot)
                                     elseif kind == 'Station' then score = isFirstStation and 150 or 116
                                     elseif kind == 'Equipment' then score = 100
                                     else score = 69 end
+                                    if groupName == 'BoatSlots' and settings.boatFocus then
+                                        if kind == 'Station' then score += 30 end
+                                        if kind == 'Equipment' then score += 18 end
+                                        if kind == 'Decoration' then score += 15 end
+                                    end
                                     if kind == 'Equipment' then
-                                        if equipment and upgradeBoost[equipment] then
+                                        local boatStep, boatInfo
+                                        if groupName == 'BoatSlots' then
+                                            boatStep, boatInfo = boatPadStep(pad)
+                                        end
+                                        if boatInfo then
+                                            if boatInfo.payBoost and boatInfo.payBoost > 1 then
+                                                score += 42 + (boatInfo.payBoost-1)*14
+                                            else
+                                                score += boatStep == 1 and 27 or 20
+                                            end
+                                        elseif equipment and upgradeBoost[equipment] then
                                             score += upgradeBoost[equipment]
                                         elseif groupName == 'Slots' then
                                             local stage = tonumber(pad:GetAttribute('Stage'))
@@ -710,6 +856,7 @@ local function buyPad(target)
     local slot = pad.Parent
     local beforeLevel = slot:GetAttribute('Level')
     local beforeActive = slot:GetAttribute('Active')
+    local beforeBoatUpgrades = slot:GetAttribute('UpgradesDone')
     local beforeStage = pad:GetAttribute('Stage')
     local beforePrice = pad:GetAttribute('Price')
     local beforeParent = pad.Parent
@@ -718,6 +865,8 @@ local function buyPad(target)
         if not pad.Parent or pad.Parent ~= beforeParent then return true end
         if not act.Parent or not isEnabledPart(act) then return true end
         if slot:GetAttribute('Level') ~= beforeLevel or slot:GetAttribute('Active') ~= beforeActive
+            or slot:GetAttribute('UpgradesDone') ~= beforeBoatUpgrades
+            or (target.group == 'BoatSlots' and not pad.Parent)
             or pad:GetAttribute('Stage') ~= beforeStage or pad:GetAttribute('Locked') ~= beforeLocked
             or pad:GetAttribute('Price') ~= beforePrice then return true end
         if target.price > 0 and cash() <= beforeCash - target.price * 0.85 then return true end
@@ -750,6 +899,7 @@ local function buyPad(target)
     end
     if confirmed() then
         state.bought += 1
+        if target.group == 'BoatSlots' then state.boatBuys += 1 end
         state.lastBuy = os.clock()
         state.lastAction = os.clock()
         buttonBackoff[pad] = os.clock() + 2.7
@@ -879,6 +1029,10 @@ farm:CreateSection('Live activity')
 statusLabel = farm:CreateLabel('Starting...')
 detailLabel = farm:CreateLabel('Waiting for plot')
 local options = window:CreateTab('Progression')
+options:CreateSection('Boat docks')
+options:CreateToggle({Name='Wash Boats & Yachts',CurrentValue=settings.boatWash,Callback=function(v) settings.boatWash=v end})
+options:CreateToggle({Name='Buy Boat Berths & Equipment',CurrentValue=settings.boatPurchases,Callback=function(v) settings.boatPurchases=v end})
+options:CreateToggle({Name='Focus Boat Progression',CurrentValue=settings.boatFocus,Callback=function(v) settings.boatFocus=v end})
 options:CreateSection('Expansion')
 options:CreateToggle({Name='Unlock New Zones',CurrentValue=settings.zones,Callback=function(v) settings.zones=v end})
 options:CreateToggle({Name='Buy Decorations',CurrentValue=settings.decorations,Callback=function(v) settings.decorations=v end})
@@ -897,6 +1051,7 @@ advanced:CreateSlider({Name='Tween Speed',Range={40,250},Increment=5,CurrentValu
 advanced:CreateSlider({Name='Spray Delay',Range={0.12,0.40},Increment=0.01,CurrentValue=settings.washInterval,Suffix='s',Callback=function(v) settings.washInterval=v end})
 advanced:CreateSlider({Name='Wash Batch Size',Range={4,25},Increment=1,CurrentValue=settings.batchSize,Callback=function(v) settings.batchSize=v end})
 advanced:CreateSlider({Name='Washing Distance',Range={10,22},Increment=1,CurrentValue=settings.distance,Suffix=' studs',Callback=function(v) settings.distance=v end})
+advanced:CreateSlider({Name='Boat Hull Scan Spacing',Range={1,3},Increment=0.2,CurrentValue=settings.boatSpacing,Suffix=' studs',Callback=function(v) settings.boatSpacing=v end})
 advanced:CreateToggle({Name='Noclip During Tween Only',CurrentValue=settings.useNoclip,Callback=function(v) settings.useNoclip=v end})
 advanced:CreateToggle({Name='Automatic Stall Recovery',CurrentValue=settings.autoRecover,Callback=function(v) settings.autoRecover=v end})
 advanced:CreateToggle({Name='Anti AFK',CurrentValue=settings.antiAfk,Callback=function(v) settings.antiAfk=v end})
@@ -912,7 +1067,7 @@ task.spawn(function()
             if os.clock() - lastUi > .6 then
                 lastUi = os.clock()
                 if statusLabel then statusLabel:Set(state.status) end
-                if detailLabel then detailLabel:Set('Cash '..money(cash())..' | '..state.bought..' buys | '..state.sprays..' sprays | '..state.bonuses..' bonuses | '..state.availablePurchasePads..' buyable') end
+                if detailLabel then detailLabel:Set('Cash '..money(cash())..' | '..state.bought..' buys | '..state.sprays..' sprays | '..state.bonuses..' bonuses | '..state.availablePurchasePads..' buyable | Boats '..state.boatBuys..' buys / '..state.boatSprays..' sprays') end
             end
             local nowCash = cash()
             if nowCash ~= state.lastCash then
@@ -960,4 +1115,4 @@ task.spawn(function()
     end
 end)
 
-PuckUI:Notify({Title='Wash the Car v1.2',Content='New upgrade pad names supported, smarter purchasing, and late-zone placeholder filtering.',Duration=5})
+PuckUI:Notify({Title='Wash the Car v1.3',Content='Boat hull washing and berth purchases improved; deep raycasts, waterline filtering and boat controls.',Duration=5})
