@@ -1,10 +1,12 @@
 --[[
-    PuckAFK | Wash the Car | Smart Autofarm v1.5
+    PuckAFK | Wash the Car | Smart Autofarm v1.6
     Place 70733580049633
     Audited against the supplied 2026-10-19 .rbxl and network log.
 
     Smart tycoon purchases, legitimate client-side dirt erasing, native-format
     spray batching, free bonuses, player upgrades, offline claim and smooth travel.
+    v1.6: Space pads/upgrade chains, parked spacecraft tracking, warp-route guards,
+    starship surface coverage, altitude-aware smooth travel and Space controls.
     v1.5: parked-aircraft safeguards, runway exclusion, wing/fuselage sampling,
     airport purchase chain, plane stand unlocks, and larger-plane spray batching.
     v1.4: in-bay car guard, moving-vehicle rejection, fast high-coverage boat sprays,
@@ -59,6 +61,9 @@ local settings = {
     planeWash = true, planePurchases = true, planeFocus = true,
     planeSpacing = 3.2, planeRayBudget = 120, planeStandRadius = 73,
     fastPlaneWash = true,
+    spaceWash = true, spacePurchases = true, spaceFocus = true,
+    fastSpaceWash = true, spaceSpacing = 3.0, spaceRayBudget = 140,
+    spaceStandRadius = 76, spaceTravelSpeed = 240,
 }
 local state = {
     status = 'Starting', plot = nil, target = nil, currentTween = nil,
@@ -73,8 +78,9 @@ local state = {
     boatsDetected = 0, boatSprays = 0, boatBuys = 0,
     carsOutOfRange = 0, boatRayHits = 0,
     planesDetected = 0, planeSprays = 0, planeBuys = 0, planesOutOfStand = 0,
+    shipsDetected = 0, spaceSprays = 0, spaceBuys = 0, shipsOutOfStand = 0,
 }
-local PlaneConfig, PlanePaths
+local PlaneConfig, PlanePaths, SpaceConfig
 local planePathCache = setmetatable({}, {__mode = 'k'})
 local cleanCursor = setmetatable({}, {__mode = 'k'})
 local faceBlocked = setmetatable({}, {__mode = 'k'})
@@ -256,6 +262,67 @@ local function airportHitAllowed(model, plot, point)
     return Vector3.new(d.X, 0, d.Z).Magnitude <= settings.planeStandRadius + 52
        and math.abs(d.Y) <= 65
 end
+-- SpaceAnimator uses the BoatFrom/BoatTo interpolation protocol even for
+-- starships. The portal approach can leave a moving ship under SpaceSlots;
+-- only a finished arrival at its real, high-altitude stand is washable.
+local function spaceSlot(model, plot)
+    if not model or not plot then return end
+    local group = plot:FindFirstChild('SpaceSlots')
+    if not group or not model:IsDescendantOf(group) then return end
+    local node = model.Parent
+    while node and node ~= group do
+        if node.Parent == group then return node end
+        node = node.Parent
+    end
+end
+local function spaceSpot(model, plot)
+    local slot = spaceSlot(model, plot)
+    local spot = slot and slot:FindFirstChild('Spot')
+    if spot and spot:IsA('BasePart') then return spot.Position end
+    if spot and spot:IsA('Model') then return spot:GetPivot().Position end
+end
+local function spaceAtStand(model, plot)
+    local anchor = spaceSpot(model, plot)
+    if not anchor or anchor.Y <= 1000 then return false end
+    local anim = model:FindFirstChild('AnimRoot') or model.PrimaryPart
+    if not anim or not anim:IsA('BasePart') then return false end
+    local d = anim.Position - anchor
+    local maxXZ = math.clamp(settings.spaceStandRadius, 48, 115)
+    if Vector3.new(d.X, 0, d.Z).Magnitude > maxXZ or math.abs(d.Y) > 47 then
+        return false
+    end
+    local destination = model:GetAttribute('BoatTo')
+    if typeof(destination) == 'CFrame' then
+        local d2 = anim.Position - destination.Position
+        -- The dock pose may place a ship above the pad, but never far away
+        -- down the arrival portal lane while the model is still moving.
+        if d2.Magnitude > maxXZ + 28 then return false end
+    end
+    return true
+end
+local function spaceReady(model, plot)
+    if plot:GetAttribute('SpaceZoneActive') ~= true
+       or not animationSettled(model) or not spaceAtStand(model,plot) then return false end
+    local mode = string.lower(tostring(model:GetAttribute('BoatMode') or ''))
+    if mode:find('leave',1,true) or mode:find('depart',1,true)
+       or mode:find('exit',1,true) then return false end
+    local start, duration = model:GetAttribute('MoveStart'), model:GetAttribute('MoveDuration')
+    if type(start) == 'number' then
+        -- Directly matches SpaceAnimator's MoveStart / MoveDuration timing.
+        if type(duration) ~= 'number' or duration <= 0 then return false end
+        local elapsed = WS:GetServerTimeNow() - start
+        if elapsed < 0 or elapsed < duration + 0.75 then return false end
+    end
+    return model:GetAttribute('WashOpen') == true
+end
+local function spaceHitAllowed(model, plot, point)
+    local anchor = spaceSpot(model, plot)
+    if not anchor or typeof(point) ~= 'Vector3' then return false end
+    local d = point - anchor
+    -- Never follow portal approaches, another plot, or space vehicles in flight.
+    return Vector3.new(d.X,0,d.Z).Magnitude <= settings.spaceStandRadius + 60
+       and math.abs(d.Y) <= 75 and point.Y > 1000
+end
 local function isOwnVehicle(model, plot)
     if not model or not model:IsA('Model') or not plot or not model:IsDescendantOf(plot) then return false end
     local node = model
@@ -327,7 +394,12 @@ local function tweenTo(point, lookAt, maxTime)
     local direction = lookAt and Vector3.new(lookAt.X - point.X, 0, lookAt.Z - point.Z)
     if not direction or direction.Magnitude < 0.01 then direction = root.CFrame.LookVector end
     local goal = CFrame.lookAt(point, point + direction.Unit)
-    local duration = math.clamp(dist / math.max(tonumber(settings.tweenSpeed) or 100, 20), 0.08, maxTime or 18)
+    local longSpaceLeg = math.abs(point.Y - root.Position.Y) > 850
+       and math.max(point.Y, root.Position.Y) > 1000
+    local speed = longSpaceLeg and math.max(tonumber(settings.spaceTravelSpeed) or 240, 40)
+        or math.max(tonumber(settings.tweenSpeed) or 100, 20)
+    local duration = longSpaceLeg and math.max(0.08, dist / speed)
+        or math.clamp(dist / speed, 0.08, maxTime or 18)
     local activeTween = TweenService:Create(root, TweenInfo.new(duration, Enum.EasingStyle.Linear), {CFrame = goal})
     state.currentTween = activeTween
     travelActive = true
@@ -363,6 +435,9 @@ PlaneConfig = try('plane-config', function()
 end)
 PlanePaths = try('plane-paths', function()
     return require((RS:WaitForChild('Planes', 15)):WaitForChild('PlanePaths', 15))
+end)
+SpaceConfig = try('space-config', function()
+    return require((RS:WaitForChild('Space', 15)):WaitForChild('SpaceConfig', 15))
 end)
 local BoatConfig = try('boat-config', function()
     return require((RS:WaitForChild('Boats', 15)):WaitForChild('BoatConfig', 15))
@@ -452,11 +527,14 @@ local function chooseVehicle(plot)
             local model = vehicleOf(part, plot)
             local boat = model and isBoatVehicle(model, plot)
             local plane = model and planeSlot(model, plot) ~= nil
+            local ship = model and spaceSlot(model, plot) ~= nil
             if model and (not boat or settings.boatWash)
                and (not plane or settings.planeWash)
+               and (not ship or settings.spaceWash)
                and animationSettled(model)
                and (not boat or boatReady(model))
                and (not plane or planeReady(model, plot))
+               and (not ship or spaceReady(model, plot))
                and carAtBay(model)
                and (vehicleBackoff[model] or 0) < os.clock() then
                 local count = pendingFaces(part)
@@ -466,7 +544,7 @@ local function chooseVehicle(plot)
                         data = {model = model, parts = {}, faces = 0, equivalentFaces = 0,
                                 nearest = math.huge, pay = vehiclePay(model), progress = progress,
                                 liveProgress = 0, seen = 0, partsAmount = 0,
-                                isBoat = boat, isPlane = plane}
+                                isBoat = boat, isPlane = plane, isSpace = ship}
                         cars[model] = data
                     end
                     data.faces += count
@@ -515,13 +593,19 @@ local function chooseVehicle(plot)
             score += 37
             if data.liveProgress > 0 then score += 8 end
         end
+        if data.isSpace and settings.spaceFocus then
+            score += 51
+            if data.liveProgress > 0 then score += 10 end
+        end
         if not best or score > bestScore then best, bestScore = data, score end
     end
     state.boatsDetected = 0
     state.planesDetected = 0
+    state.shipsDetected = 0
     for _, data in pairs(cars) do
         if data.isBoat then state.boatsDetected += 1 end
         if data.isPlane then state.planesDetected += 1 end
+        if data.isSpace then state.shipsDetected += 1 end
     end
     if best then
         table.sort(best.parts, function(a,b)
@@ -572,18 +656,19 @@ local function aboveBoatWaterline(part, hit)
     return (hit.Position - worldLine):Dot(worldUp) > .05
            and hit.Normal:Dot(worldUp) > -.75
 end
-local function faceRay(part, face, index, isBoat, isPlane)
+local function faceRay(part, face, index, isBoat, isPlane, isSpace)
     local n, u, v, depth, lenU, lenV = geometry(part, face)
     if not n then return end
     -- Larger spacing prevents repeatedly washing the same tiny patch of a
     -- large yacht/sail hull. Actual ray hits still gate every spray.
     local spacing = isBoat and math.clamp(settings.boatSpacing, 1.4, 6)
-        or isPlane and math.clamp(settings.planeSpacing, 1.8, 7) or 2.5
-    local cols = math.clamp(math.ceil(lenU / spacing), 1, (isBoat or isPlane) and 128 or 32)
-    local rows = math.clamp(math.ceil(lenV / spacing), 1, (isBoat or isPlane) and 128 or 32)
+        or isPlane and math.clamp(settings.planeSpacing, 1.8, 7)
+        or isSpace and math.clamp(settings.spaceSpacing, 1.6, 7) or 2.5
+    local cols = math.clamp(math.ceil(lenU / spacing), 1, (isBoat or isPlane or isSpace) and 128 or 32)
+    local rows = math.clamp(math.ceil(lenV / spacing), 1, (isBoat or isPlane or isSpace) and 128 or 32)
     local total = cols * rows
     local x, y
-    if isBoat or isPlane then
+    if isBoat or isPlane or isSpace then
         x = radicalInverse(index, 2)
         y = radicalInverse(index, 3)
     else
@@ -601,18 +686,20 @@ local function faceRay(part, face, index, isBoat, isPlane)
     params.FilterDescendantsInstances = {part}
     -- The old 8-stud ray only reached 4 studs below the bounding box. Boats
     -- are often hollow/curved meshes with surfaces far deeper than that.
-    local reach = (isBoat or isPlane) and (2 * depth + 8) or math.max(8, depth * 2 + 6)
+    local reach = (isBoat or isPlane or isSpace) and (2 * depth + 8) or math.max(8, depth * 2 + 6)
     local hit = WS:Raycast(origin, -worldNormal * reach, params)
     if not hit or hit.Instance ~= part then return nil, total end
     if isBoat and not aboveBoatWaterline(part, hit) then return nil, total end
     if hit.Normal:Dot(worldNormal) < 0.02 then return nil, total end
     return hit, total, facePoint, worldNormal
 end
-local function ensureNear(part, face, isBoat, hitPoint, hitNormal, model, isPlane, plot)
+local function ensureNear(part, face, isBoat, hitPoint, hitNormal, model, isPlane, plot, isSpace)
     if model and not animationSettled(model) then return false end
     if model and not carAtBay(model) then return false end
     if isPlane and (not planeReady(model, plot)
         or not airportHitAllowed(model, plot, hitPoint)) then return false end
+    if isSpace and (not spaceReady(model,plot)
+        or not spaceHitAllowed(model,plot,hitPoint)) then return false end
     local _, root = character()
     if not root then return false end
     local n, _, _, depth = geometry(part, face)
@@ -621,11 +708,16 @@ local function ensureNear(part, face, isBoat, hitPoint, hitNormal, model, isPlan
     local faceCenter = part.Position + worldNormal * depth
     local near = faceCenter + worldNormal * math.clamp(settings.distance, 9, 23)
     local approach = faceCenter
-    if (isBoat or isPlane) and typeof(hitPoint) == 'Vector3' and typeof(hitNormal) == 'Vector3' then
+    if (isBoat or isPlane or isSpace) and typeof(hitPoint) == 'Vector3' and typeof(hitNormal) == 'Vector3' then
         -- Follow the actual wetted hull, not the centre of its often oversized box.
         approach = hitPoint
         near = hitPoint + hitNormal.Unit * math.clamp(settings.distance, 10, 19)
                       + Vector3.new(0, 3, 0)
+        if isSpace then
+            local stand = spaceSpot(model,plot)
+            if stand then near = Vector3.new(near.X, math.max(near.Y,stand.Y + 3),near.Z) end
+            if not spaceHitAllowed(model,plot,near) then return false end
+        end
         if isPlane then
             local stand = planeSpot(model, plot)
             -- Keep the player above the airport platform on low wing surfaces.
@@ -635,7 +727,7 @@ local function ensureNear(part, face, isBoat, hitPoint, hitNormal, model, isPlan
     elseif face == 'Bottom' then
         near = part.Position + part.CFrame.RightVector * 10 + Vector3.new(0,-2,0)
     end
-    local reach = (isBoat or isPlane) and 30 or 31
+    local reach = (isBoat or isPlane or isSpace) and 30 or 31
     if model then
         local spot = baySpot(model)
         if spot then
@@ -645,12 +737,12 @@ local function ensureNear(part, face, isBoat, hitPoint, hitNormal, model, isPlan
         end
     end
     if (root.Position - approach).Magnitude > reach then
-        status('Moving to ' .. (isBoat and 'boat hull ' or isPlane and 'parked plane ' or '') .. face .. ' surface')
+        status('Moving to ' .. (isBoat and 'boat hull ' or isPlane and 'parked plane ' or isSpace and 'spacecraft ' or '') .. face .. ' surface')
         if not tweenTo(near, approach, 25) then return false end
-        waitActive((isBoat or isPlane) and 0.22 or 0.5)
+        waitActive((isBoat or isPlane or isSpace) and 0.22 or 0.5)
     end
     local _, current = character()
-    return current ~= nil and (current.Position - approach).Magnitude < ((isBoat or isPlane) and 38 or 42)
+    return current ~= nil and (current.Position - approach).Magnitude < ((isBoat or isPlane or isSpace) and 38 or 42)
 end
 local function validSprayPart(part, model, plot)
     return alive and part.Parent and model.Parent and model:IsDescendantOf(plot)
@@ -670,19 +762,23 @@ local function sprayBatch(part, face, model, plot)
     if not animationSettled(model) or not carAtBay(model) then return false end
     local isBoat = isBoatVehicle(model, plot)
     local isPlane = planeSlot(model,plot) ~= nil
-    local isLarge = isBoat or isPlane
+    local isSpace = spaceSlot(model,plot) ~= nil
+    local isLarge = isBoat or isPlane or isSpace
     if isBoat and (not settings.boatWash or not boatReady(model)) then return false end
     if isPlane and (not settings.planeWash or not planeReady(model,plot)) then return false end
+    if isSpace and (not settings.spaceWash or not spaceReady(model,plot)) then return false end
     local cursorMap = cleanCursor[part] or {}
     cleanCursor[part] = cursorMap
     local startIndex = cursorMap[face] or 1
     local records, attempts = {}, 0
     local maxPoints = math.clamp(math.floor(settings.batchSize), 1, 30)
-    if (isBoat and settings.fastBoatWash) or (isPlane and settings.fastPlaneWash) then
+    if (isBoat and settings.fastBoatWash) or (isPlane and settings.fastPlaneWash)
+       or (isSpace and settings.fastSpaceWash) then
         maxPoints = math.max(maxPoints, 25)
     end
     local scanBudget = isBoat and math.clamp(settings.boatRayBudget, 30, 170)
-        or isPlane and math.clamp(settings.planeRayBudget, 30, 200) or maxPoints
+        or isPlane and math.clamp(settings.planeRayBudget, 30, 200)
+        or isSpace and math.clamp(settings.spaceRayBudget, 30, 220) or maxPoints
     local span = brushSize()
     local _, faceAxis = geometry(part, face)
     local sweepAxis = part.CFrame:VectorToWorldSpace(faceAxis)
@@ -694,12 +790,14 @@ local function sprayBatch(part, face, model, plot)
     -- box point can be many studs away from the actual ship surface.
     if isLarge then
         local searchCount = 24
-        if (isBoat and settings.fastBoatWash) or (isPlane and settings.fastPlaneWash) then
+        if (isBoat and settings.fastBoatWash) or (isPlane and settings.fastPlaneWash)
+           or (isSpace and settings.fastSpaceWash) then
             searchCount = 56
         end
         for i = 0, searchCount - 1 do
-            local hit = faceRay(part, face, startIndex+i, isBoat, isPlane)
-            if hit and (not isPlane or airportHitAllowed(model,plot,hit.Position)) then
+            local hit = faceRay(part, face, startIndex+i, isBoat, isPlane, isSpace)
+            if hit and (not isPlane or airportHitAllowed(model,plot,hit.Position))
+               and (not isSpace or spaceHitAllowed(model,plot,hit.Position)) then
                 firstHit = hit; swept = i; break
             end
         end
@@ -709,7 +807,7 @@ local function sprayBatch(part, face, model, plot)
             faceBlocked[part][face] = os.clock() + 1.2
             return false
         end
-        if not ensureNear(part,face,isBoat,firstHit.Position,firstHit.Normal,model,isPlane,plot) then
+        if not ensureNear(part,face,isBoat,firstHit.Position,firstHit.Normal,model,isPlane,plot,isSpace) then
             return false
         end
     elseif not ensureNear(part,face,false,nil,nil,model,false,plot) then
@@ -720,18 +818,20 @@ local function sprayBatch(part, face, model, plot)
         if not animationSettled(model) or not carAtBay(model) then break end
         if isBoat and not boatReady(model) then break end
         if isPlane and not planeReady(model,plot) then break end
+        if isSpace and not spaceReady(model,plot) then break end
         local hit, total
         if firstHit then
             hit = firstHit
             firstHit = nil
         else
-            hit,total = faceRay(part,face,startIndex+swept,isBoat,isPlane)
+            hit,total = faceRay(part,face,startIndex+swept,isBoat,isPlane,isSpace)
         end
         lastTotal = total or lastTotal
         local rayIndex = startIndex + swept
         swept += 1
         if hit and isLarge then
             if isPlane and not airportHitAllowed(model,plot,hit.Position) then hit = nil end
+            if hit and isSpace and not spaceHitAllowed(model,plot,hit.Position) then hit = nil end
         end
         if hit and isLarge then
             -- On a very large yacht/sail hull, hits from the same bounding box
@@ -773,8 +873,8 @@ local function sprayBatch(part, face, model, plot)
             -- No accepted local hull rays: relocate to the nearest observed
             -- reachable hull section. Retry from its actual sample index.
             cursorMap[face] = farIndex
-            if ensureNear(part,face,isBoat,farHit.Position,farHit.Normal,model,isPlane,plot) then
-                status('Repositioned beside another '..(isPlane and 'aircraft' or 'boat')..' surface')
+            if ensureNear(part,face,isBoat,farHit.Position,farHit.Normal,model,isPlane,plot,isSpace) then
+                status('Repositioned beside another '..(isPlane and 'aircraft' or isSpace and 'starship' or 'boat')..' surface')
             end
             return false
         end
@@ -783,22 +883,25 @@ local function sprayBatch(part, face, model, plot)
         return false
     end
     local now = os.clock()
-    local interval = ((isBoat and settings.fastBoatWash) or (isPlane and settings.fastPlaneWash))
+    local interval = ((isBoat and settings.fastBoatWash) or (isPlane and settings.fastPlaneWash)
+        or (isSpace and settings.fastSpaceWash))
         and math.min(settings.washInterval,0.12) or settings.washInterval
     if now - state.lastWash < interval then
         waitActive(interval - (now-state.lastWash))
     end
     if not alive or not animationSettled(model) or not carAtBay(model)
        or (isBoat and not boatReady(model))
-       or (isPlane and not planeReady(model,plot)) then return false end
+       or (isPlane and not planeReady(model,plot))
+       or (isSpace and not spaceReady(model,plot)) then return false end
     state.lastWash = os.clock()
     local ok = pcall(WashEvent.FireServer, WashEvent, 'reportSpray', records, sweepAxis)
     if ok then
         state.sprays += 1
         if isBoat then state.boatSprays += 1 end
         if isPlane then state.planeSprays += 1 end
+        if isSpace then state.spaceSprays += 1 end
         state.lastAction = os.clock()
-        status('Cleaning ' .. (isBoat and 'boat ' or isPlane and 'aircraft ' or '') .. model.Name .. ' • ' .. face)
+        status('Cleaning ' .. (isBoat and 'boat ' or isPlane and 'aircraft ' or isSpace and 'spaceship ' or '') .. model.Name .. ' • ' .. face)
         return true
     end
     return false
@@ -828,7 +931,8 @@ local function doWash(plot)
     end
     local didSomething = false
     local stampLimit = picked.isBoat and settings.fastBoatWash and 9
-        or picked.isPlane and settings.fastPlaneWash and 10 or 6
+        or picked.isPlane and settings.fastPlaneWash and 10
+        or picked.isSpace and settings.fastSpaceWash and 11 or 6
     -- Boat runs get more active spray batches per decision, but all sprays
     -- remain serialized and paced; buyers/free bonuses are still revisited.
     local fired = 0
@@ -881,7 +985,8 @@ local function padIdentity(pad, slot, groupName)
         local equipment = label:match('upgrade[_%-](.+)') or label:match('upgrade(.+)')
         return 'Equipment', equipment
     end
-    if label == 'button' or label:find('unlock',1,true)
+    if label:find('zone',1,true) or label:find('floor',1,true) then return 'Zone', nil end
+    if label == 'button' or label:match('button$') or label:find('unlock',1,true)
         or label:find('station',1,true) then return 'Station', nil end
     -- A game update may add new name formats. Accept only direct children
     -- with their own replicated Price attribute and active touch component.
@@ -917,6 +1022,14 @@ local function planePadStep(pad)
         end
     end
 end
+local function spacePadStep(pad)
+    if not SpaceConfig or type(SpaceConfig.Upgrades) ~= 'table' then return end
+    local label = string.lower(pad.Name)
+    for i, info in ipairs(SpaceConfig.Upgrades) do
+        if label:find('upgrade',1,true) and type(info.id) == 'string'
+           and label:find(string.lower(info.id),1,true) then return i, info end
+    end
+end
 local function slotReady(slot, pad, groupName)
     if groupName == 'Slots' then
         local stage = tonumber(pad:GetAttribute('Stage'))
@@ -928,6 +1041,17 @@ local function slotReady(slot, pad, groupName)
         local label = string.lower(pad.Name)
         if label:find('upgrade',1,true) and tonumber(slot.Name) then
             if slot:GetAttribute('Active') ~= true then return false end
+        end
+        if groupName == 'SpaceSlots' then
+            local plot = slot.Parent and slot.Parent.Parent
+            local zoneActive = plot and plot:GetAttribute('SpaceZoneActive') == true
+            local isZonePad = slot.Name == 'Zone' or slot.Name == 'Floor'
+            if not zoneActive and not isZonePad then return false end
+            if (label:find('upgrade',1,true) or label:find('decor',1,true))
+               and tonumber(slot.Name) and slot:GetAttribute('Active') ~= true then return false end
+            local stage = tonumber(pad:GetAttribute('Stage')) or select(1, spacePadStep(pad))
+            local done = tonumber(slot:GetAttribute('UpgradesDone'))
+            if label:find('upgrade',1,true) and stage and done and stage ~= done + 1 then return false end
         end
         if groupName == 'PlaneSlots' then
             if label:find('upgrade',1,true) and slot:GetAttribute('Active') ~= true then return false end
@@ -982,6 +1106,7 @@ local function purchaseCandidates(plot)
                                 local kind, equipment = padIdentity(pad,slot,groupName)
                                 if kind and (groupName ~= 'BoatSlots' or settings.boatPurchases)
                                   and (groupName ~= 'PlaneSlots' or settings.planePurchases)
+                                  and (groupName ~= 'SpaceSlots' or settings.spacePurchases)
                                   and (buttonBackoff[pad] or 0) <= os.clock()
                                   and (groupName ~= 'Slots' or not originalBayPads or originalBayPads[pad])
                                   and slotReady(slot,pad,groupName)
@@ -997,6 +1122,11 @@ local function purchaseCandidates(plot)
                                     elseif kind == 'Station' then score = isFirstStation and 150 or 116
                                     elseif kind == 'Equipment' then score = 100
                                     else score = 69 end
+                                    if groupName == 'SpaceSlots' and settings.spaceFocus then
+                                        if kind == 'Station' then score += 48 end
+                                        if kind == 'Equipment' then score += 31 end
+                                        if kind == 'Decoration' then score += 24 end
+                                    end
                                     if groupName == 'PlaneSlots' and settings.planeFocus then
                                         if kind == 'Station' then score += 39 end
                                         if kind == 'Equipment' then score += 23 end
@@ -1016,7 +1146,17 @@ local function purchaseCandidates(plot)
                                         if groupName == 'PlaneSlots' then
                                             planeStep,planeInfo = planePadStep(pad)
                                         end
-                                        if planeInfo then
+                                        local spaceStep, spaceInfo
+                                        if groupName == 'SpaceSlots' then
+                                            spaceStep, spaceInfo = spacePadStep(pad)
+                                        end
+                                        if spaceInfo then
+                                            if spaceInfo.payBoost and spaceInfo.payBoost > 1 then
+                                                score += 48 + (spaceInfo.payBoost - 1) * 18
+                                            else
+                                                score += spaceStep == 1 and 32 or 22
+                                            end
+                                        elseif planeInfo then
                                             if planeInfo.payBoost and planeInfo.payBoost > 1 then
                                                 score += 45 + (planeInfo.payBoost - 1) * 17
                                             else
@@ -1089,6 +1229,10 @@ local function buyPad(target)
     local beforeActive = slot:GetAttribute('Active')
     local beforeBoatUpgrades = slot:GetAttribute('UpgradesDone')
     local beforePlaneDecor = slot:GetAttribute('DecorLevel')
+    local beforeSpaceDecor = slot:GetAttribute('DecorLevel')
+    local beforeSpaceUpgrades = slot:GetAttribute('UpgradesDone')
+    local beforeSpaceZone = plot:GetAttribute('SpaceZoneActive')
+    local beforeSpaceDecorCount = plot:GetAttribute('SpaceDecorCount')
     local beforeStage = pad:GetAttribute('Stage')
     local beforePrice = pad:GetAttribute('Price')
     local beforeParent = pad.Parent
@@ -1099,6 +1243,10 @@ local function buyPad(target)
         if slot:GetAttribute('Level') ~= beforeLevel or slot:GetAttribute('Active') ~= beforeActive
             or slot:GetAttribute('UpgradesDone') ~= beforeBoatUpgrades
             or (target.group == 'PlaneSlots' and slot:GetAttribute('DecorLevel') ~= beforePlaneDecor)
+            or (target.group == 'SpaceSlots' and (slot:GetAttribute('DecorLevel') ~= beforeSpaceDecor
+                or slot:GetAttribute('UpgradesDone') ~= beforeSpaceUpgrades
+                or plot:GetAttribute('SpaceZoneActive') ~= beforeSpaceZone
+                or plot:GetAttribute('SpaceDecorCount') ~= beforeSpaceDecorCount))
             or (target.group == 'BoatSlots' and not pad.Parent)
             or pad:GetAttribute('Stage') ~= beforeStage or pad:GetAttribute('Locked') ~= beforeLocked
             or pad:GetAttribute('Price') ~= beforePrice then return true end
@@ -1134,6 +1282,7 @@ local function buyPad(target)
         state.bought += 1
         if target.group == 'BoatSlots' then state.boatBuys += 1 end
         if target.group == 'PlaneSlots' then state.planeBuys += 1 end
+        if target.group == 'SpaceSlots' then state.spaceBuys += 1 end
         state.lastBuy = os.clock()
         state.lastAction = os.clock()
         buttonBackoff[pad] = os.clock() + 2.7
@@ -1273,6 +1422,11 @@ options:CreateToggle({Name='Wash Parked Planes',CurrentValue=settings.planeWash,
 options:CreateToggle({Name='Buy Plane Stands & Equipment',CurrentValue=settings.planePurchases,Callback=function(v) settings.planePurchases=v end})
 options:CreateToggle({Name='Focus Airport Progression',CurrentValue=settings.planeFocus,Callback=function(v) settings.planeFocus=v end})
 options:CreateToggle({Name='Fast Plane Wing Cleaning',CurrentValue=settings.fastPlaneWash,Callback=function(v) settings.fastPlaneWash=v end})
+options:CreateSection('Space & spacecraft')
+options:CreateToggle({Name='Wash Parked Spacecraft',CurrentValue=settings.spaceWash,Callback=function(v) settings.spaceWash=v end})
+options:CreateToggle({Name='Buy Space Stands & Equipment',CurrentValue=settings.spacePurchases,Callback=function(v) settings.spacePurchases=v end})
+options:CreateToggle({Name='Focus Space Progression',CurrentValue=settings.spaceFocus,Callback=function(v) settings.spaceFocus=v end})
+options:CreateToggle({Name='Fast Spaceship Hull Cleaning',CurrentValue=settings.fastSpaceWash,Callback=function(v) settings.fastSpaceWash=v end})
 options:CreateSection('Expansion')
 options:CreateToggle({Name='Unlock New Zones',CurrentValue=settings.zones,Callback=function(v) settings.zones=v end})
 options:CreateToggle({Name='Buy Decorations',CurrentValue=settings.decorations,Callback=function(v) settings.decorations=v end})
@@ -1296,6 +1450,10 @@ advanced:CreateSlider({Name='Boat Scan Budget',Range={30,170},Increment=10,Curre
 advanced:CreateSlider({Name='Plane Surface Spacing',Range={1.8,7},Increment=0.2,CurrentValue=settings.planeSpacing,Suffix=' studs',Callback=function(v) settings.planeSpacing=v end})
 advanced:CreateSlider({Name='Plane Scan Budget',Range={30,200},Increment=10,CurrentValue=settings.planeRayBudget,Suffix=' rays',Callback=function(v) settings.planeRayBudget=v end})
 advanced:CreateSlider({Name='Airport Stand Radius',Range={45,95},Increment=5,CurrentValue=settings.planeStandRadius,Suffix=' studs',Callback=function(v) settings.planeStandRadius=v end})
+advanced:CreateSlider({Name='Spacecraft Scan Spacing',Range={1.6,7},Increment=0.2,CurrentValue=settings.spaceSpacing,Suffix=' studs',Callback=function(v) settings.spaceSpacing=v end})
+advanced:CreateSlider({Name='Spacecraft Scan Budget',Range={30,220},Increment=10,CurrentValue=settings.spaceRayBudget,Suffix=' rays',Callback=function(v) settings.spaceRayBudget=v end})
+advanced:CreateSlider({Name='Space Stand Radius',Range={48,115},Increment=5,CurrentValue=settings.spaceStandRadius,Suffix=' studs',Callback=function(v) settings.spaceStandRadius=v end})
+advanced:CreateSlider({Name='Space Altitude Tween Speed',Range={80,400},Increment=10,CurrentValue=settings.spaceTravelSpeed,Suffix=' studs/s',Callback=function(v) settings.spaceTravelSpeed=v end})
 advanced:CreateSlider({Name='Car Bay Safety Radius',Range={45,115},Increment=5,CurrentValue=settings.carBayRadius,Suffix=' studs',Callback=function(v) settings.carBayRadius=v end})
 advanced:CreateToggle({Name='Noclip During Tween Only',CurrentValue=settings.useNoclip,Callback=function(v) settings.useNoclip=v end})
 advanced:CreateToggle({Name='Automatic Stall Recovery',CurrentValue=settings.autoRecover,Callback=function(v) settings.autoRecover=v end})
@@ -1312,7 +1470,7 @@ task.spawn(function()
             if os.clock() - lastUi > .6 then
                 lastUi = os.clock()
                 if statusLabel then statusLabel:Set(state.status) end
-                if detailLabel then detailLabel:Set('Cash '..money(cash())..' | '..state.bought..' buys | '..state.sprays..' sprays | '..state.bonuses..' bonuses | '..state.availablePurchasePads..' buyable | Boats '..state.boatBuys..' buys / '..state.boatSprays..' sprays | Planes '..state.planeBuys..' buys / '..state.planeSprays..' sprays') end
+                if detailLabel then detailLabel:Set('Cash '..money(cash())..' | '..state.bought..' buys | '..state.sprays..' sprays | '..state.bonuses..' bonuses | '..state.availablePurchasePads..' buyable | Boats '..state.boatBuys..' buys / '..state.boatSprays..' sprays | Planes '..state.planeBuys..' buys / '..state.planeSprays..' sprays | Space '..state.spaceBuys..' buys / '..state.spaceSprays..' sprays') end
             end
             local nowCash = cash()
             if nowCash ~= state.lastCash then
@@ -1360,4 +1518,4 @@ task.spawn(function()
     end
 end)
 
-PuckUI:Notify({Title='Wash the Car v1.5',Content='Airport: plane stands and upgrades, fast wing washing, parked-only targets, no runway chasing.',Duration=5})
+PuckUI:Notify({Title='Wash the Car v1.6',Content='Space: starship stands, plasma/foam/brush/dryer upgrades, parked-only hull cleaning, no portal chasing.',Duration=5})
