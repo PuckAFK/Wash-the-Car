@@ -1,10 +1,13 @@
 --[[
-    PuckAFK | Wash the Car | Smart Autofarm v1.12
+    PuckAFK | Wash the Car | Smart Autofarm v1.13
     Place 70733580049633
     Audited against the supplied 2026-10-19 .rbxl and network log.
 
     Smart tycoon purchases, legitimate client-side dirt erasing, native-format
     spray batching, free bonuses, player upgrades, offline claim and smooth travel.
+    v1.13: keep confirmed working blue-door travel, remove diagnostic UI/logs,
+    detect and wash ships across the Space/Ring/Saturn stands, source-aware
+    upgrade priorities, strict high-altitude and station gating.
     v1.12: detected Space doorway always takes priority, simplified direct
     approach and walk-through, full phase/position/movement diagnostics,
     looser visual detection (including nameless cyan meshes and SPACE BASE sign).
@@ -108,6 +111,8 @@ local state = {
     portalPreemptions = 0, portalCheckAt = 0,
 }
 local PlaneConfig, PlanePaths, SpaceConfig
+local HighZoneConfig = {}
+local highZoneGroups = {'SpaceSlots','Ring6Slots','Ring5Slots','Ring4Slots','Ring3Slots','SaturnSlots'}
 local planePathCache = setmetatable({}, {__mode = 'k'})
 local cleanCursor = setmetatable({}, {__mode = 'k'})
 local faceBlocked = setmetatable({}, {__mode = 'k'})
@@ -117,22 +122,12 @@ local vehicleProgress = setmetatable({}, {__mode = 'k'})
 local connections = {}
 local travelCollisions = {}
 local travelActive = false
-local ui, window, statusLabel, detailLabel, doorDebugLabel, doorLogLabel
-local doorLogs = {}
-local function doorLog(event, detail)
-    local message = string.format('[+%.1fs] %s%s', os.clock()-startedAt, tostring(event),
-        detail and (' | '..tostring(detail)) or '')
-    if doorLogs[#doorLogs] ~= message then
-        doorLogs[#doorLogs+1] = message
-        if #doorLogs > 45 then table.remove(doorLogs,1) end
-        warn('[PuckAFK Wash][Space Door] '..message)
-    end
-end
-local function portalPhase(phase, message)
-    if state.portalPhase ~= phase then
-        state.portalPhase = phase
-        doorLog(phase,message)
-    end
+local ui, window, statusLabel, detailLabel
+-- Blue-door traversal is intentionally unchanged from the live-tested v1.12.
+-- Detailed door logging has been retired; status/errors remain visible normally.
+local function doorLog(...) end
+local function portalPhase(phase)
+    state.portalPhase = phase
 end
 
 local function status(msg)
@@ -310,12 +305,21 @@ end
 -- only a finished arrival at its real, high-altitude stand is washable.
 local function spaceSlot(model, plot)
     if not model or not plot then return end
-    local group = plot:FindFirstChild('SpaceSlots')
-    if not group or not model:IsDescendantOf(group) then return end
-    local node = model.Parent
-    while node and node ~= group do
-        if node.Parent == group then return node end
-        node = node.Parent
+    -- Space and its surrounding Rings/Saturn use the same anchored stand,
+    -- water/foam/brush/dryer and WashOpen surface protocol.
+    for _, groupName in ipairs(highZoneGroups) do
+        local group = plot:FindFirstChild(groupName)
+        if group and model:IsDescendantOf(group) then
+            local node = model.Parent
+            while node and node ~= group do
+                if node.Parent == group then
+                    -- Never select vessels under Zone/Traffic folders.
+                    if tonumber(node.Name) then return node, groupName end
+                    return
+                end
+                node = node.Parent
+            end
+        end
     end
 end
 local function spaceSpot(model, plot)
@@ -344,8 +348,10 @@ local function spaceAtStand(model, plot)
     return true
 end
 local function spaceReady(model, plot)
-    if not (plot:GetAttribute('SpaceZoneActive') == true or state.spaceCommitted)
-       or not animationSettled(model) or not spaceAtStand(model,plot) then return false end
+    local slot, groupName = spaceSlot(model, plot)
+    if not slot or not groupName then return false end
+    if groupName == 'SpaceSlots' and not (plot:GetAttribute('SpaceZoneActive') == true or state.spaceCommitted) then return false end
+    if not animationSettled(model) or not spaceAtStand(model,plot) then return false end
     local mode = string.lower(tostring(model:GetAttribute('BoatMode') or ''))
     if mode:find('leave',1,true) or mode:find('depart',1,true)
        or mode:find('exit',1,true) then return false end
@@ -888,8 +894,8 @@ local function enforceSpaceResidence(plot)
     state.portalPriority = 'Portal entry (ground paused)'
     if not door then
         state.spaceResidence = 'Space ready; looking for door'
-        status('Space unlocked: doorway not detected; open Debug for details')
-        state.portalLastError = 'Door part not found - use Mark Door Here if needed'
+        status('Space unlocked; looking for blue doorway')
+        state.portalLastError = 'Blue doorway not present in live plot yet'
         portalPhase('Door not found','Rocket may contain empty placeholder models')
         return true
     end
@@ -909,75 +915,6 @@ local function enforceSpaceResidence(plot)
     return true
 end
 
-local function vecText(v)
-    if typeof(v) ~= 'Vector3' then return 'none' end
-    return string.format('(%.1f, %.1f, %.1f)',v.X,v.Y,v.Z)
-end
-local function doorReport()
-    local p = ownPlot()
-    local _, root = character()
-    local rocket = p and p:FindFirstChild('SpaceRocket',true)
-    local decor = p and p:FindFirstChild('Decor')
-    local savedDoor = rocket and rocket:FindFirstChild('PortalDoor')
-    local parts = 0
-    local closeCandidates = {}
-    local center = rocket and rocket:GetPivot().Position or (root and root.Position)
-    if p then
-        for _, v in ipairs(p:GetDescendants()) do
-            if v:IsA('BasePart') and center and (v.Position-center).Magnitude < 95 then
-                local n = v.Name:lower()
-                local cyan = v.Color.B > .72 and v.Color.G > .58 and v.Color.R < .6
-                if cyan or n:find('portal',1,true) or n:find('door',1,true)
-                    or n:find('boarding',1,true) or n:find('teleport',1,true) then
-                    parts += 1
-                    if #closeCandidates < 18 then
-                        closeCandidates[#closeCandidates+1] = string.format('%s | %s | Size %s | Touch %s | Hidden %s',
-                            v:GetFullName(),vecText(v.Position),vecText(v.Size),tostring(v.CanTouch),
-                            tostring(v:GetAttribute('_lvHidden')))
-                    end
-                end
-            end
-        end
-    end
-    local ret = {
-        'PuckAFK Wash the Car v1.11 / Space Door Debug',
-        'Runtime: '..string.format('%.1fs', os.clock()-startedAt),
-        'State: '..state.status,
-        'Phase: '..state.portalPhase,
-        'Last failure: '..state.portalLastError,
-        'Portal transition: '..state.portalTransition,
-        'Space residence: '..state.spaceResidence,
-        'Priority: '..state.portalPriority,
-        'Space auto mode: '..tostring(settings.autoEnterAndStaySpace),
-        'Master enabled: '..tostring(settings.master),
-        'SpaceZoneActive: '..tostring(p and p:GetAttribute('SpaceZoneActive')),
-        'Plot: '..(p and p:GetFullName() or 'Not found'),
-        'Character: '..(root and vecText(root.Position) or 'Not found'),
-        'Rocket: '..(rocket and rocket:GetFullName() or 'Not found'),
-        'Rocket pivot: '..(rocket and vecText(rocket:GetPivot().Position) or 'none'),
-        'Decor: '..(decor and decor:GetFullName() or 'Not found'),
-        'PortalDoor model: '..(savedDoor and savedDoor:GetFullName() or 'Not found'),
-        'PortalDoor children: '..(savedDoor and tostring(#savedDoor:GetDescendants()) or 'none'),
-        'Door selection: '..state.portalDetectedBy,
-        'Scanner: '..state.portalScanNote,
-        'Candidate selected: '..state.portalLastCandidate,
-        'Candidate distance: '..tostring(state.portalLastDistance),
-        'Movement: '..state.portalMovement,
-        'Door priority preemptions: '..tostring(state.portalPreemptions),
-        'Selected door: '..state.portalLocation,
-        'Door candidates: '..tostring(state.portalCandidates),
-        'Nearby blue/door parts: '..tostring(parts),
-        'Manual door marker: '..(state.manualDoor and vecText(state.manualDoor.Position) or 'none'),
-        'Portal successes/failures: '..state.portalTrips..' / '..state.portalFailures,
-        'Retry seconds: '..tostring(math.max(0,math.ceil(state.portalRetryAfter-os.clock()))),
-        'Nearby candidate sample:',
-    }
-    for _, s in ipairs(closeCandidates) do ret[#ret+1] = s end
-    ret[#ret+1] = 'Recent door events:'
-    for _, s in ipairs(doorLogs) do ret[#ret+1] = s end
-    return table.concat(ret,'\n')
-end
-
 local Wash = RS:WaitForChild('Wash', 20)
 local WashEvent = Wash and Wash:FindFirstChild('WashEvent')
 local CleanableManager = Wash and try('wash-module', function() return require(Wash:WaitForChild('CleanableManager', 15)) end)
@@ -993,6 +930,15 @@ end)
 SpaceConfig = try('space-config', function()
     return require((RS:WaitForChild('Space', 15)):WaitForChild('SpaceConfig', 15))
 end)
+HighZoneConfig.SpaceSlots = SpaceConfig
+for _, zone in ipairs({'Ring6','Ring5','Ring4','Ring3','Saturn'}) do
+    local key = zone .. 'Slots'
+    HighZoneConfig[key] = try(zone..'-config',function()
+        local folder = RS:FindFirstChild(zone)
+        local module = folder and folder:FindFirstChild(zone..'Config')
+        return module and require(module)
+    end)
+end
 local BoatConfig = try('boat-config', function()
     return require((RS:WaitForChild('Boats', 15)):WaitForChild('BoatConfig', 15))
 end)
@@ -1009,7 +955,6 @@ local transitionEvent = spaceFolder and spaceFolder:FindFirstChild('TransitionEv
 if transitionEvent and transitionEvent:IsA('RemoteEvent') then
     addConnection(transitionEvent.OnClientEvent:Connect(function(phase)
         state.portalTransition = tostring(phase)
-        doorLog('Server transition event', tostring(phase))
     end))
 end
 local PuckUI = try('PuckUI', function()
@@ -1130,7 +1075,8 @@ local function chooseVehicle(plot)
     local best, bestScore
     for _, data in pairs(cars) do
         local estimatedEffort = math.max(data.equivalentFaces, 0.6)
-        local travelSeconds = math.max(0,data.nearest - 34)/math.max(settings.tweenSpeed,20)
+        local chosenSpeed = data.isSpace and settings.spaceTravelSpeed or settings.tweenSpeed
+        local travelSeconds = math.max(0,data.nearest - 34)/math.max(chosenSpeed,20)
         local payoutRank = math.log10(math.max(data.pay,1))
         local score = (payoutRank*11 + 13) / (1 + estimatedEffort*0.045 + travelSeconds*.45)
         if settings.washPrioritization then
@@ -1585,10 +1531,11 @@ local function planePadStep(pad)
         end
     end
 end
-local function spacePadStep(pad)
-    if not SpaceConfig or type(SpaceConfig.Upgrades) ~= 'table' then return end
+local function spacePadStep(pad, groupName)
+    local config = HighZoneConfig[groupName or 'SpaceSlots'] or SpaceConfig
+    if not config or type(config.Upgrades) ~= 'table' then return end
     local label = string.lower(pad.Name)
-    for i, info in ipairs(SpaceConfig.Upgrades) do
+    for i, info in ipairs(config.Upgrades) do
         if label:find('upgrade',1,true) and type(info.id) == 'string'
            and label:find(string.lower(info.id),1,true) then return i, info end
     end
@@ -1605,16 +1552,18 @@ local function slotReady(slot, pad, groupName)
         if label:find('upgrade',1,true) and tonumber(slot.Name) then
             if slot:GetAttribute('Active') ~= true then return false end
         end
-        if groupName == 'SpaceSlots' then
+        if HighZoneConfig[groupName] or groupName == 'SpaceSlots' then
             local plot = slot.Parent and slot.Parent.Parent
-            local zoneActive = plot and plot:GetAttribute('SpaceZoneActive') == true
             local isZonePad = slot.Name == 'Zone' or slot.Name == 'Floor'
-            if not zoneActive and not state.spaceCommitted and not isZonePad then return false end
+            if groupName == 'SpaceSlots' then
+                local zoneActive = plot and plot:GetAttribute('SpaceZoneActive') == true
+                if not zoneActive and not state.spaceCommitted and not isZonePad then return false end
+            end
             if (label:find('upgrade',1,true) or label:find('decor',1,true))
                and tonumber(slot.Name) and slot:GetAttribute('Active') ~= true then return false end
-            local stage = tonumber(pad:GetAttribute('Stage')) or select(1, spacePadStep(pad))
+            local stage = tonumber(pad:GetAttribute('Stage')) or select(1, spacePadStep(pad,groupName))
             local done = tonumber(slot:GetAttribute('UpgradesDone'))
-            if label:find('upgrade',1,true) and stage and done and stage ~= done + 1 then return false end
+            if label:find('upgrade',1,true) and stage and done and stage ~= done+1 then return false end
         end
         if groupName == 'PlaneSlots' then
             if label:find('upgrade',1,true) and slot:GetAttribute('Active') ~= true then return false end
@@ -1669,7 +1618,7 @@ local function purchaseCandidates(plot)
                                 local kind, equipment = padIdentity(pad,slot,groupName)
                                 if kind and (groupName ~= 'BoatSlots' or settings.boatPurchases)
                                   and (groupName ~= 'PlaneSlots' or settings.planePurchases)
-                                  and (groupName ~= 'SpaceSlots' or settings.spacePurchases)
+                                  and (not HighZoneConfig[groupName] or settings.spacePurchases)
                                   and (not spaceOnlyTargets(plot) or highWorld(act.Position))
                                   and (buttonBackoff[pad] or 0) <= os.clock()
                                   and (groupName ~= 'Slots' or not originalBayPads or originalBayPads[pad])
@@ -1686,7 +1635,7 @@ local function purchaseCandidates(plot)
                                     elseif kind == 'Station' then score = isFirstStation and 150 or 116
                                     elseif kind == 'Equipment' then score = 100
                                     else score = 69 end
-                                    if groupName == 'SpaceSlots' and settings.spaceFocus then
+                                    if (HighZoneConfig[groupName] or groupName == 'SpaceSlots') and settings.spaceFocus then
                                         if kind == 'Station' then score += 48 end
                                         if kind == 'Equipment' then score += 31 end
                                         if kind == 'Decoration' then score += 24 end
@@ -1711,8 +1660,8 @@ local function purchaseCandidates(plot)
                                             planeStep,planeInfo = planePadStep(pad)
                                         end
                                         local spaceStep, spaceInfo
-                                        if groupName == 'SpaceSlots' then
-                                            spaceStep, spaceInfo = spacePadStep(pad)
+                                        if HighZoneConfig[groupName] or groupName == 'SpaceSlots' then
+                                            spaceStep, spaceInfo = spacePadStep(pad,groupName)
                                         end
                                         if spaceInfo then
                                             if spaceInfo.payBoost and spaceInfo.payBoost > 1 then
@@ -1807,7 +1756,7 @@ local function buyPad(target)
         if slot:GetAttribute('Level') ~= beforeLevel or slot:GetAttribute('Active') ~= beforeActive
             or slot:GetAttribute('UpgradesDone') ~= beforeBoatUpgrades
             or (target.group == 'PlaneSlots' and slot:GetAttribute('DecorLevel') ~= beforePlaneDecor)
-            or (target.group == 'SpaceSlots' and (slot:GetAttribute('DecorLevel') ~= beforeSpaceDecor
+            or (HighZoneConfig[target.group] and (slot:GetAttribute('DecorLevel') ~= beforeSpaceDecor
                 or slot:GetAttribute('UpgradesDone') ~= beforeSpaceUpgrades
                 or plot:GetAttribute('SpaceZoneActive') ~= beforeSpaceZone
                 or plot:GetAttribute('SpaceDecorCount') ~= beforeSpaceDecorCount))
@@ -1846,7 +1795,7 @@ local function buyPad(target)
         state.bought += 1
         if target.group == 'BoatSlots' then state.boatBuys += 1 end
         if target.group == 'PlaneSlots' then state.planeBuys += 1 end
-        if target.group == 'SpaceSlots' then state.spaceBuys += 1 end
+        if HighZoneConfig[target.group] then state.spaceBuys += 1 end
         state.lastBuy = os.clock()
         state.lastAction = os.clock()
         buttonBackoff[pad] = os.clock() + 2.7
@@ -2017,55 +1966,6 @@ options:CreateSlider({Name='Cash Reserve',Range={0,20},Increment=1,CurrentValue=
 options:CreateSection('Free income')
 options:CreateToggle({Name='Collect Free Bonuses',CurrentValue=settings.bonuses,Callback=function(v) settings.bonuses=v end})
 options:CreateToggle({Name='Claim Offline Earnings (1x)',CurrentValue=settings.offline,Callback=function(v) settings.offline=v end})
-local debugTab = window:CreateTab('Debug')
-debugTab:CreateSection('Space doorway')
-doorDebugLabel = debugTab:CreateLabel('Waiting for Space door check')
-doorLogLabel = debugTab:CreateLabel('Recent door activity will appear here')
-debugTab:CreateButton({Name='Test Door Now',Callback=function()
-    settings.autoEnterAndStaySpace=true
-    state.portalRetryAfter = 0
-    state.portalScanAt = 0
-    state.portalScanResult = nil
-    doorLog('Test Door Now','Forced a new live scan; next controller tick will approach the door')
-    status('Retrying Space doorway')
-end})
-debugTab:CreateButton({Name='Mark Door Here (stand facing blue door)',Callback=function()
-    local p = ownPlot()
-    local _, root = character()
-    if not p or not root or highWorld(root.Position) then
-        doorLog('Door mark failed','Stand at ground door on your own plot')
-        return
-    end
-    local forward = Vector3.new(root.CFrame.LookVector.X,0,root.CFrame.LookVector.Z)
-    if forward.Magnitude < .01 then return end
-    forward = forward.Unit
-    state.manualDoor = {
-        manual=true, plot=p, Position=root.Position + forward*3.5 + Vector3.new(0,1.5,0),
-        Size=Vector3.new(1,9,8), axis=forward,
-    }
-    state.portalScanAt=0
-    state.portalRetryAfter=0
-    state.portalDetectedBy='Manual'
-    doorLog('Manual entrance marked','Facing '..vecText(forward)..' | Position '..vecText(state.manualDoor.Position))
-    status('Blue door marked; approaching and walking through it')
-end})
-debugTab:CreateButton({Name='Clear Manual Door Mark',Callback=function()
-    state.manualDoor=nil
-    state.portalScanAt=0
-    state.portalScanResult=nil
-    doorLog('Manual mark cleared','Back to automatic doorway detection')
-end})
-debugTab:CreateButton({Name='Copy Space Debug',Callback=function()
-    local report=doorReport()
-    local clip = (type(setclipboard)=='function' and setclipboard)
-        or (type(toclipboard)=='function' and toclipboard)
-    if clip then
-        local ok = pcall(clip,report)
-        if ok then doorLog('Debug copied','Paste the report in chat'); return end
-    end
-    warn('[PuckAFK Wash][Space Door DEBUG]\n'..report)
-    doorLog('Clipboard unavailable','Report printed to executor console')
-end})
 local advanced = window:CreateTab('Settings')
 advanced:CreateSection('Movement & washing')
 advanced:CreateSlider({Name='Tween Speed',Range={40,250},Increment=5,CurrentValue=settings.tweenSpeed,Suffix=' studs/s',Callback=function(v) settings.tweenSpeed=v end})
@@ -2097,19 +1997,6 @@ task.spawn(function()
             if os.clock() - lastUi > .6 then
                 lastUi = os.clock()
                 if statusLabel then statusLabel:Set(state.status) end
-                if doorDebugLabel then
-                    local remaining=math.max(0,math.ceil(state.portalRetryAfter-os.clock()))
-                    doorDebugLabel:Set('Phase: '..state.portalPhase..' | Door: '..state.portalDetectedBy
-                        ..' | Ready: '..tostring(state.spaceDoorReady)..' | Attempts: '
-                        ..tostring(state.portalTrips+state.portalFailures)..' | Retry: '..remaining..'s'
-                        ..' | Error: '..state.portalLastError
-                        ..' | '..state.portalScanNote) 
-                end
-                if doorLogLabel then
-                    local rows={}
-                    for i=math.max(1,#doorLogs-5),#doorLogs do rows[#rows+1]=doorLogs[i] end
-                    doorLogLabel:Set(#rows>0 and table.concat(rows,' / ') or 'No door attempts yet')
-                end
                 if detailLabel then detailLabel:Set('Cash '..money(cash())..' | '..state.bought..' buys | '..state.sprays..' sprays | '..state.bonuses..' bonuses | '..state.availablePurchasePads..' buyable | Boats '..state.boatBuys..' buys / '..state.boatSprays..' sprays | Planes '..state.planeBuys..' buys / '..state.planeSprays..' sprays | Space '..state.spaceBuys..' buys / '..state.spaceSprays..' sprays | Portal '..state.spaceResidence..' | Priority '..state.portalPriority..' | Trips '..state.portalTrips..' / '..state.portalFailures..' fails') end
             end
             local nowCash = cash()
@@ -2179,4 +2066,4 @@ task.spawn(function()
     end
 end)
 
-PuckUI:Notify({Title='Wash the Car v1.12',Content='When the blue door appears, move directly to it. Debug records each movement and teleport result.',Duration=5})
+PuckUI:Notify({Title='Wash the Car v1.13',Content='Live-tested blue-door entry retained. Space, rings and Saturn progression improved.',Duration=5})
