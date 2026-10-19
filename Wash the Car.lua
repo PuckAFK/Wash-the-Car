@@ -1,3 +1,20 @@
+--[[
+    PuckAFK | Wash the Car | Smart Autofarm v1.2
+    Place 70733580049633
+    Audited against the supplied 2026-10-19 .rbxl and network log.
+
+    Smart tycoon purchases, legitimate client-side dirt erasing, native-format
+    spray batching, free bonuses, player upgrades, offline claim and smooth travel.
+    v1.2: dynamic named upgrade/decor pad recognition, placeholder filtering,
+    richer multi-zone purchase planning, better purchase touch recovery.
+    v1.1: dirt-progress scoring, real brush size, end-game ROI weighting,
+    first-slot unlock planning, high-payout / quick-tip target selection, and
+    performance-aware scanning.
+    Robux products and premium pads are intentionally excluded.
+
+    PuckUI's built-in Configs tab persists controls when executor file APIs exist.
+    Script has not been live-tested. Server-side acceptance may vary.
+]]
 
 if game.PlaceId ~= 70733580049633 then
     warn('[PuckAFK Wash] Unsupported place: ' .. tostring(game.PlaceId))
@@ -27,6 +44,7 @@ local settings = {
     tweenSpeed = 125, washInterval = 0.14, batchSize = 16,
     reservePercent = 3, distance = 16, useNoclip = true,
     smartSpending = true, autoRecover = true, antiAfk = true,
+    purchaseUpgrades = true, purchaseStations = true, ignorePlaceholders = true,
     washPrioritization = true, fastTips = true, wealthyZonePriority = true,
 }
 local state = {
@@ -38,6 +56,7 @@ local state = {
     lastOffline = 0, vehicleCheck = 0, lastShop = 0,
     lastIncomeSample = os.clock(), cashAtSample = 0, incomePerMinute = 0,
     lastVehicleScan = 0, scanCache = nil, lastPurchaseScan = 0, purchaseCache = {},
+    foundPurchasePads = 0, availablePurchasePads = 0, lastPurchaseName = 'None',
 }
 local cleanCursor = setmetatable({}, {__mode = 'k'})
 local faceBlocked = setmetatable({}, {__mode = 'k'})
@@ -529,96 +548,138 @@ local function doWash(plot)
     return didSomething
 end
 
--- Original car bays use stage/decoration buttons. Later zones use station/floor/zone buttons.
+-- Purchase discovery, verified against the 2026-10-19 extended place dump.
+-- The earlier script only recognized models ending in "Button". Other zones
+-- actually use models named HeliUpgrade_Foam, HeliUpgrade_Water, etc. Some
+-- future-ring/space buttons are only attribute stubs (zero physical children).
+-- Never attempt to purchase a stub: it does not have an Activate touch part.
 local slotGroups = {
     Slots = 1, HeliSlots = 2, BoatSlots = 3, PlaneSlots = 4, SpaceSlots = 5,
-    Ring6Slots = 6, Ring5Slots = 7, Ring4Slots = 8, Ring3Slots = 9, SaturnSlots = 10,
-    HubSlots = 1,
+    Ring6Slots = 6, Ring5Slots = 7, Ring4Slots = 8, Ring3Slots = 9,
+    SaturnSlots = 10, HubSlots = 11,
 }
-local function padType(model)
-    local n = model.Name
-    if n == 'Button' or n == 'UpgradeButton' or n == 'DecorButton'
-        or n == 'BoatDecorButton' or n == 'HeliDecorButton'
-        or n == 'PlaneDecorButton' or n == 'SpaceDecorButton' then return true end
-    -- future equipment variants are safe only when under a known slot group.
-    return n:sub(-6) == 'Button'
+local function padIdentity(pad, slot, groupName)
+    local label = string.lower(pad.Name)
+    if label:sub(1,1) == '_' or label:find('bought',1,true)
+        or label:find('product',1,true) or label:find('shop',1,true)
+        or label:find('pass',1,true) then return end
+    if slot.Name == 'Zone' or slot.Name == 'Floor' or groupName == 'HubSlots' then
+        return 'Zone', nil
+    end
+    if label:find('decor',1,true) then return 'Decoration', nil end
+    if label:find('upgrade',1,true) then
+        local equipment = label:match('upgrade[_%-](.+)') or label:match('upgrade(.+)')
+        return 'Equipment', equipment
+    end
+    if label == 'button' or label:find('unlock',1,true)
+        or label:find('station',1,true) then return 'Station', nil end
+    -- A game update may add new name formats. Accept only direct children
+    -- with their own replicated Price attribute and active touch component.
+    return 'Equipment', nil
 end
+local function livePad(pad)
+    if not (pad and (pad:IsA('Model') or pad:IsA('Folder'))) then return end
+    if paidAncestor(pad) or pad:GetAttribute('Locked') == true then return end
+    local price = pad:GetAttribute('Price')
+    if type(price) ~= 'number' or price ~= price or price == math.huge
+        or price < 0 then return end
+    local act = pad:FindFirstChild('Activate')
+    if not isEnabledPart(act) then return end
+    return act, price
+end
+local function slotReady(slot, pad, groupName)
+    if groupName == 'Slots' then
+        local stage = tonumber(pad:GetAttribute('Stage'))
+        local level = tonumber(slot:GetAttribute('Level')) or
+            (slot:GetAttribute('Active') and 1 or 0)
+        if pad.Name == 'UpgradeButton' and (not stage or stage ~= level + 1) then return false end
+        if pad.Name == 'DecorButton' and level < 1 then return false end
+    else
+        -- Station upgrades require that their station be unlocked first.
+        -- Future zones may place decorative pads under the area itself.
+        local label = string.lower(pad.Name)
+        if label:find('upgrade',1,true) and tonumber(slot.Name) then
+            if slot:GetAttribute('Active') ~= true then return false end
+        end
+    end
+    return true
+end
+local upgradeBoost = {
+    foam = 39, dryer = 31, goldconveyor = 26,
+    water = 15, waterfront = 15, waterback = 15,
+    brushes = 13, brushtop = 13, brushsidel = 12, brushsider = 12,
+}
 local function purchaseCandidates(plot)
     local available = {}
     local haveCash = cash()
     local _, root = character()
     if not root then return available end
-    -- Match the game's own bay dependency planner for the original car wash.
-    -- Other zones have separate layouts and are discovered independently below.
     local originalBayPads
     if PurchaseTargets and type(PurchaseTargets.collect) == 'function' then
-        local ok, result = pcall(PurchaseTargets.collect, plot)
-        if ok and type(result) == 'table' and next(result) then originalBayPads = result end
+        local ok, targets = pcall(PurchaseTargets.collect, plot)
+        if ok and type(targets) == 'table' and next(targets) then
+            originalBayPads = targets
+        end
     end
+    local discovered = 0
+    -- Iterate known live plot slot folders. Never scan ReplicatedStorage's
+    -- PlotLodStorage: its objects are templates and cannot be purchased.
     for groupName, area in pairs(slotGroups) do
         local group = plot:FindFirstChild(groupName)
         if group then
             for _, slot in ipairs(group:GetChildren()) do
                 if slot:IsA('Model') or slot:IsA('Folder') then
                     for _, pad in ipairs(slot:GetChildren()) do
-                        if (pad:IsA('Model') or pad:IsA('Folder')) and padType(pad) and not paidAncestor(pad) then
-                            local act = pad:FindFirstChild('Activate')
-                            local p = tonumber(pad:GetAttribute('Price'))
-                            if p and p >= 0 and p == p and p ~= math.huge and p <= haveCash
-                              and pad:GetAttribute('Locked') ~= true and isEnabledPart(act)
-                              and (buttonBackoff[pad] or 0) <= os.clock()
-                              and (groupName ~= 'Slots' or not originalBayPads or originalBayPads[pad]) then
-                                local kind
-                                if slot.Name == 'Zone' or slot.Name == 'Floor' or groupName == 'HubSlots' then kind = 'Zone'
-                                elseif pad.Name:find('Decor') then kind = 'Decoration'
-                                elseif pad.Name == 'UpgradeButton' then kind = 'Equipment'
-                                else kind = 'Station' end
-                                if (kind ~= 'Decoration' or settings.decorations)
-                                    and (kind ~= 'Zone' or settings.zones) then
-                                    local lv = tonumber(slot:GetAttribute('Level')) or 0
-                                    local stage = tonumber(pad:GetAttribute('Stage'))
-                                    if (pad.Name ~= 'UpgradeButton' or not stage or stage == lv+1)
-                                        and (pad.Name ~= 'DecorButton' or lv >= 1) then
-                                        local distance = (root.Position-act.Position).Magnitude
-                                        local score = (kind == 'Zone' and 134 or kind == 'Station' and 113 or kind == 'Equipment' and 62 or 45)
-                                        score += math.min(area*4, 42)
-                                        if kind == 'Equipment' then
-                                            -- Heli/boats/planes/space/saturn/rings have a common four-upgrade
-                                            -- order: water (1), foam x2 (2), brushes (3), dryer x1.5 (4).
-                                            if groupName ~= 'Slots' then
-                                                if stage == 2 then score += 26 end
-                                                if stage == 4 then score += 18 end
-                                                if stage == 1 or stage == 3 then score += 9 end
-                                            else
-                                                -- Cars: stage 3 foam x2; stage 8 dryer x1.5; stage 9 gold x1.25.
-                                                if stage == 3 then score += 30
-                                                elseif stage == 8 then score += 22
-                                                elseif stage == 9 then score += 16
-                                                else score += 11 end
-                                            end
-                                        elseif kind == 'Decoration' then
-                                            -- Decorations increase vehicle payouts (1.5x per level in
-                                            -- late zones); prioritize them more for productive high tiers.
-                                            if groupName ~= 'Slots' and (slot:GetAttribute('Active') or (lv > 0)) then
-                                                score += 12
-                                            end
-                                        end
-                                        if settings.smartSpending then
-                                            local costLog = math.log10(math.max(1,p))
-                                            score += 11 / (1 + costLog)
-                                            score -= math.min(16, distance/math.max(30,settings.tweenSpeed)*2.5)
-                                            if kind == 'Zone' and p == 0 then score += 18 end
-                                            -- Do not lose an unlocked higher-paying first station to
-                                            -- repeat lower-zone cosmetic purchases.
-                                            if kind == 'Station' and tonumber(slot.Name) == 1 then score += 18 end
-                                        else
-                                            score -= math.log10(math.max(p,1))*5
-                                        end
-                                        -- Keep a small optional reserve except for first unlocks.
-                                        local reserve = (kind=='Zone' or kind=='Station') and 0 or math.min(15, settings.reservePercent)
-                                        if haveCash >= p * (1 + reserve/100) then
-                                            table.insert(available, {pad=pad, act=act, price=p, kind=kind, group=groupName, score=score})
-                                        end
+                        if pad:IsA('Model') or pad:IsA('Folder') then
+                            local act, price = livePad(pad)
+                            if act then
+                                discovered += 1
+                                local kind, equipment = padIdentity(pad,slot,groupName)
+                                if kind and (buttonBackoff[pad] or 0) <= os.clock()
+                                  and (groupName ~= 'Slots' or not originalBayPads or originalBayPads[pad])
+                                  and slotReady(slot,pad,groupName)
+                                  and (kind ~= 'Decoration' or settings.decorations)
+                                  and (kind ~= 'Zone' or settings.zones)
+                                  and (kind ~= 'Equipment' or settings.purchaseUpgrades)
+                                  and (kind ~= 'Station' or settings.purchaseStations)
+                                  and price <= haveCash then
+                                    local dist = (root.Position - act.Position).Magnitude
+                                    local isFirstStation = kind == 'Station' and slot.Name == '1'
+                                    local score
+                                    if kind == 'Zone' then score = 170
+                                    elseif kind == 'Station' then score = isFirstStation and 150 or 116
+                                    elseif kind == 'Equipment' then score = 100
+                                    else score = 69 end
+                                    if kind == 'Equipment' then
+                                        if equipment and upgradeBoost[equipment] then
+                                            score += upgradeBoost[equipment]
+                                        elseif groupName == 'Slots' then
+                                            local stage = tonumber(pad:GetAttribute('Stage'))
+                                            local boost = ({[3]=39,[8]=31,[9]=26,[2]=13,[4]=12,[5]=12,[6]=15,[7]=15})
+                                            score += boost[stage] or 10
+                                        else score += 10 end
+                                    elseif kind == 'Decoration' then
+                                        if area >= 2 then score += 25 end
+                                        if slot:GetAttribute('Active') == true then score += 7 end
+                                    end
+                                    score += math.min(area * 3.5, 33)
+                                    if settings.smartSpending then
+                                        -- A small preference for closer/cheaper pads, after important
+                                        -- unlocks and payout multipliers are identified.
+                                        score -= math.min(22, dist/math.max(40,settings.tweenSpeed)*3)
+                                        score -= math.min(18, math.log10(math.max(price,1))*0.6)
+                                    else
+                                        score -= math.log10(math.max(price,1))*3
+                                    end
+                                    local reserve = (kind == 'Zone' or isFirstStation) and 0
+                                        or math.min(15, settings.reservePercent)
+                                    if haveCash >= price * (1 + reserve/100) then
+                                        table.insert(available, {
+                                            pad = pad, act = act, group = groupName,
+                                            kind = kind, equipment = equipment, price = price,
+                                            score = score, distance = dist,
+                                            label = groupName .. '/' .. slot.Name .. '/' .. pad.Name,
+                                        })
                                     end
                                 end
                             end
@@ -628,7 +689,9 @@ local function purchaseCandidates(plot)
             end
         end
     end
-    table.sort(available, function(a,b)
+    state.foundPurchasePads = discovered
+    state.availablePurchasePads = #available
+    table.sort(available,function(a,b)
         if a.score == b.score then return a.price < b.price end
         return a.score > b.score
     end)
@@ -636,43 +699,67 @@ local function purchaseCandidates(plot)
 end
 local function buyPad(target)
     local pad, act = target.pad, target.act
-    if not settings.master or not settings.purchases or not isEnabledPart(act) then return false end
+    if not alive or not settings.master or not settings.purchases then return false end
+    if not (pad and pad.Parent and livePad(pad) and isEnabledPart(act)) then return false end
     if cash() < target.price then return false end
-    status('Buying ' .. target.kind .. ' • ' .. money(target.price))
+    local plot = ownPlot()
+    if not plot or not pad:IsDescendantOf(plot) then return false end
+    state.lastPurchaseName = target.label
+    status('Buying '..target.label..' • '..money(target.price))
     local beforeCash = cash()
-    local oldLevel = pad.Parent and pad.Parent:GetAttribute('Level')
-    local oldActive = pad.Parent and pad.Parent:GetAttribute('Active')
-    local beforeParent = pad.Parent
+    local slot = pad.Parent
+    local beforeLevel = slot:GetAttribute('Level')
+    local beforeActive = slot:GetAttribute('Active')
     local beforeStage = pad:GetAttribute('Stage')
+    local beforePrice = pad:GetAttribute('Price')
+    local beforeParent = pad.Parent
     local beforeLocked = pad:GetAttribute('Locked')
-    local point = act.Position + Vector3.new(0, math.max(2.4, act.Size.Y/2+2), 0)
-    local arrived = tweenTo(point, act.Position, 30)
-    if not arrived or not alive then
-        buttonBackoff[pad] = os.clock() + 8
+    local function confirmed()
+        if not pad.Parent or pad.Parent ~= beforeParent then return true end
+        if not act.Parent or not isEnabledPart(act) then return true end
+        if slot:GetAttribute('Level') ~= beforeLevel or slot:GetAttribute('Active') ~= beforeActive
+            or pad:GetAttribute('Stage') ~= beforeStage or pad:GetAttribute('Locked') ~= beforeLocked
+            or pad:GetAttribute('Price') ~= beforePrice then return true end
+        if target.price > 0 and cash() <= beforeCash - target.price * 0.85 then return true end
         return false
     end
-    -- Physical touch is the primary purchase mechanism. firetouchinterest is a fallback.
-    local _, root = character()
-    if root and type(firetouchinterest) == 'function' then
-        pcall(firetouchinterest, root, act, 0)
-        task.wait(0.13)
-        pcall(firetouchinterest, root, act, 1)
+    local _, currentRoot = character()
+    if not currentRoot then return false end
+    local point = act.Position + Vector3.new(0, math.max(2.5, act.Size.Y/2 + 2.7), 0)
+    local dist = (currentRoot.Position - point).Magnitude
+    if dist > 3.8 then
+        if not tweenTo(point, act.Position, 30) or not alive or not settings.master then
+            buttonBackoff[pad] = os.clock() + 9
+            return false
+        end
     end
-    waitActive(0.48)
-    local purchased = not pad.Parent or pad.Parent ~= beforeParent or not isEnabledPart(act)
-                   or pad:GetAttribute('Locked') ~= beforeLocked or pad:GetAttribute('Stage') ~= beforeStage
-                   or (pad.Parent and pad.Parent:GetAttribute('Level') ~= oldLevel)
-                   or (pad.Parent and pad.Parent:GetAttribute('Active') ~= oldActive)
-                   or cash() <= beforeCash - math.max(1, target.price * 0.85)
-    if purchased then
+    -- Let the character settle on the purchase pad before any executor touch
+    -- fallback.  This is also usable without firetouchinterest.
+    waitActive(0.26)
+    if not confirmed() and alive and settings.master and type(firetouchinterest) == 'function' then
+        local _, root = character()
+        if root and (root.Position - act.Position).Magnitude < 10 then
+            pcall(firetouchinterest,root,act,0)
+            task.wait(0.1)
+            pcall(firetouchinterest,root,act,1)
+        end
+    end
+    local deadline = os.clock() + 1.6
+    while alive and settings.master and not confirmed() and os.clock() < deadline do
+        task.wait(0.1)
+    end
+    if confirmed() then
         state.bought += 1
         state.lastBuy = os.clock()
         state.lastAction = os.clock()
-        buttonBackoff[pad] = os.clock()+3
+        buttonBackoff[pad] = os.clock() + 2.7
+        status('Purchased '..target.label)
         return true
     end
-    buttonBackoff[pad] = os.clock()+math.min(30, 8 + state.failed)
+    -- Persistent backoff avoids looping at an inaccessible or server-locked pad.
+    buttonBackoff[pad] = os.clock() + 11
     state.failed += 1
+    status('Purchase not confirmed: '..target.label)
     return false
 end
 
@@ -691,7 +778,10 @@ local function buyPersonal(plot)
             local after = UpgradesConfig.valueFor(id,lv+1)
             local delta = tonumber(after) and tonumber(current) and current>0 and (after/current - 1) or 0
             local reserve = (settings.smartSpending and 1 + settings.reservePercent/100 or 1)
-            if currentCash >= price*reserve and (id == 'Income' or id == 'Tips' or price <= currentCash * .28) then
+            -- Do not spend an entire zone-unlock bankroll on personal stats.
+            -- Early inexpensive upgrades remain accessible.
+            local budgetLimit = math.max(5000, currentCash * 0.12)
+            if currentCash >= price*reserve and price <= budgetLimit then
                 local score = weights[id] + math.max(0,delta)*100 - math.log10(math.max(price,1))*4
                 if id=='SpongeSize' and settings.wash then score += 12 end
                 -- Tween movement means the in-game WalkSpeed stat is comparatively weak.
@@ -792,6 +882,8 @@ local options = window:CreateTab('Progression')
 options:CreateSection('Expansion')
 options:CreateToggle({Name='Unlock New Zones',CurrentValue=settings.zones,Callback=function(v) settings.zones=v end})
 options:CreateToggle({Name='Buy Decorations',CurrentValue=settings.decorations,Callback=function(v) settings.decorations=v end})
+options:CreateToggle({Name='Buy Station Upgrades',CurrentValue=settings.purchaseUpgrades,Callback=function(v) settings.purchaseUpgrades=v end})
+options:CreateToggle({Name='Buy New Stations',CurrentValue=settings.purchaseStations,Callback=function(v) settings.purchaseStations=v end})
 options:CreateToggle({Name='Smart Spending Priority',CurrentValue=settings.smartSpending,Callback=function(v) settings.smartSpending=v end})
 options:CreateToggle({Name='Prioritize High-Earning Zones',CurrentValue=settings.wealthyZonePriority,Callback=function(v) settings.wealthyZonePriority=v end})
 options:CreateToggle({Name='Favor Quick Tips',CurrentValue=settings.fastTips,Callback=function(v) settings.fastTips=v end})
@@ -820,7 +912,7 @@ task.spawn(function()
             if os.clock() - lastUi > .6 then
                 lastUi = os.clock()
                 if statusLabel then statusLabel:Set(state.status) end
-                if detailLabel then detailLabel:Set('Cash '..money(cash())..' | '..state.bought..' buys | '..state.sprays..' sprays | '..state.bonuses..' bonuses') end
+                if detailLabel then detailLabel:Set('Cash '..money(cash())..' | '..state.bought..' buys | '..state.sprays..' sprays | '..state.bonuses..' bonuses | '..state.availablePurchasePads..' buyable') end
             end
             local nowCash = cash()
             if nowCash ~= state.lastCash then
@@ -838,11 +930,13 @@ task.spawn(function()
             local _, root = character()
             if not root then status('Respawning'); task.wait(.5); return end
             claimOffline()
-            if settings.personal and buyPersonal(plot) then task.wait(.22); return end
+            -- Buy active, affordable machinery before personal upgrades so a
+            -- continuously affordable Income upgrade cannot starve station buys.
             if settings.purchases then
                 local candidates = purchaseCandidates(plot)
                 if #candidates>0 and buyPad(candidates[1]) then task.wait(.2); return end
             end
+            if settings.personal and buyPersonal(plot) then task.wait(.22); return end
             if settings.wash and doWash(plot) then task.wait(.06); return end
             if settings.autoRecover and os.clock() - state.lastAction > 25 then
                 -- Discard transient target backoffs and revisit stations when stream-in finishes.
@@ -866,4 +960,4 @@ task.spawn(function()
     end
 end)
 
-PuckUI:Notify({Title='Wash the Car v1.1',Content='Improved wash targeting, real brush scaling and multi-zone buying. Configs and Unload are available.',Duration=5})
+PuckUI:Notify({Title='Wash the Car v1.2',Content='New upgrade pad names supported, smarter purchasing, and late-zone placeholder filtering.',Duration=5})
