@@ -1,10 +1,13 @@
 --[[
-    PuckAFK | Wash the Car | Smart Autofarm v1.11
+    PuckAFK | Wash the Car | Smart Autofarm v1.12
     Place 70733580049633
     Audited against the supplied 2026-10-19 .rbxl and network log.
 
     Smart tycoon purchases, legitimate client-side dirt erasing, native-format
     spray batching, free bonuses, player upgrades, offline claim and smooth travel.
+    v1.12: detected Space doorway always takes priority, simplified direct
+    approach and walk-through, full phase/position/movement diagnostics,
+    looser visual detection (including nameless cyan meshes and SPACE BASE sign).
     v1.11: one Space-entry toggle, easy door retry, local doorway marker,
     targeted portal logs with copyable debug report and live transition events.
     v1.10: Space-first control loop and portal detector overhaul; actual live
@@ -99,6 +102,10 @@ local state = {
     portalLocation = 'Unknown', portalPriority = 'Ground until Space unlock',
     portalLastError = 'None', portalTransition = 'Not observed',
     portalDetectedBy = 'None', manualDoor = nil, portalLastTry = 0,
+    portalScanNote = 'Not scanned', portalLastCandidate = 'None',
+    portalLastDistance = -1, portalMovement = 'Idle',
+    portalLastLogKey = nil, portalLastLogAt = 0, portalLoggedScanAt = 0,
+    portalPreemptions = 0, portalCheckAt = 0,
 }
 local PlaneConfig, PlanePaths, SpaceConfig
 local planePathCache = setmetatable({}, {__mode = 'k'})
@@ -480,11 +487,12 @@ local function portalEntry(plot)
         state.portalLocation = 'Manual entrance mark'
         state.portalDetectedBy = 'Manual'
         state.portalCandidates = 1
+        state.portalScanNote = 'Manual mark supplied'
         return state.manualDoor
     end
     local now = os.clock()
     local cached = state.portalScanResult
-    if now - state.portalScanAt < 0.85 then
+    if now - state.portalScanAt < (cached == false and 3.0 or 1.3) then
         if cached == false then return nil end
         if cached and cached:IsDescendantOf(WS) then return cached end
     end
@@ -492,62 +500,125 @@ local function portalEntry(plot)
     state.portalScanResult = false
     state.portalCandidates = 0
     state.portalLocation = 'Not found'
+    state.portalDetectedBy = 'None'
     local decor = plot:FindFirstChild('Decor')
     local rocket = decor and decor:FindFirstChild('SpaceRocket')
     local door = rocket and rocket:FindFirstChild('PortalDoor')
-    local best, bestScore = nil, -math.huge
+    local _, root = character()
+
+    -- The saved PortalDoor/Boarding models in the supplied place contain no
+    -- parts. Scan the live geometry rather than expecting a fixed child path.
+    -- A GUI reading SPACE BASE can also identify an otherwise unnamed panel.
+    local signPos
+    for _, gui in ipairs(plot:GetDescendants()) do
+        if (gui:IsA('TextLabel') or gui:IsA('TextButton'))
+            and type(gui.Text)=='string' and gui.Text:upper():find('SPACE%s*BASE') then
+            local sg = gui:FindFirstAncestorWhichIsA('SurfaceGui')
+                or gui:FindFirstAncestorWhichIsA('BillboardGui')
+            local adornee = sg and (sg.Adornee or sg.Parent)
+            if adornee and adornee:IsA('BasePart') then
+                signPos = adornee.Position
+                break
+            end
+        end
+    end
+    local rocketPosition
+    if rocket then
+        for _, p in ipairs(rocket:GetDescendants()) do
+            if p:IsA('BasePart') and not highWorld(p.Position) then
+                rocketPosition = p.Position
+                break
+            end
+        end
+    end
+    local reference = signPos or rocketPosition
+    local best, bestScore
+    local closest, closestScore
+    local inspected, cyanFound, namedFound = 0, 0, 0
     local function consider(part)
         if not part:IsA('BasePart') or not part:IsDescendantOf(WS)
-            or paidAncestor(part) or highWorld(part.Position)
-            or part:GetAttribute('_lvHidden') == true then return end
+            or highWorld(part.Position) or paidAncestor(part)
+            or part:GetAttribute('_lvHidden')==true then return end
+        inspected += 1
         local n = part.Name:lower()
         local inDoor = door ~= nil and part:IsDescendantOf(door)
         local inRocket = rocket ~= nil and part:IsDescendantOf(rocket)
-        local blue = part.Color.B >= .72 and part.Color.G >= .62
-            and part.Color.R < .52 and part.Color.B > part.Color.R * 1.25
         local named = n:find('portal',1,true) or n:find('teleport',1,true)
-            or n:find('boarding',1,true) or n:find('horizon',1,true)
-            or n:find('enter',1,true) or n:find('door',1,true)
-        local badName = n:find('sign',1,true) or n:find('light',1,true)
+            or n:find('boarding',1,true) or n:find('door',1,true)
+            or n:find('entrance',1,true) or n:find('gateway',1,true)
+        local bad = n:find('robux',1,true) or n:find('sign',1,true)
             or n:find('rail',1,true) or n:find('frame',1,true)
             or n:find('trim',1,true) or n:find('label',1,true)
-        local height, width = part.Size.Y, math.max(part.Size.X,part.Size.Z)
-        local doorSized = height >= 5 and height <= 40 and width >= 2.5 and width <= 35
-        local trigger = named and part.CanTouch and height >= 3 and height <= 45
-        -- Ignore random cyan decoration. Accept either a visible doorway or a
-        -- door-owned physical trigger even when the trigger is transparent.
-        if badName or not ((blue and doorSized) or (trigger and (inDoor or inRocket))) then return end
-        if not inRocket and not inDoor then
-            -- Outside SpaceRocket, require a convincingly named portal panel;
-            -- no other player's plot or generic neon effects may qualify.
-            if not (blue and named and doorSized) then return end
-        end
-        state.portalCandidates += 1
-        local score = (inDoor and 140 or inRocket and 70 or 0)
-            + (blue and 110 or 0) + (doorSized and 24 or 0)
-            + (named and 42 or 0) + (part.CanTouch and 18 or 0)
+        local width = math.max(part.Size.X,part.Size.Z)
+        local height = part.Size.Y
+        local upright = height >= 5 and height <= 44 and width >= 2.5 and width <= 30
+            and math.min(part.Size.X,part.Size.Z) <= 22
+        -- Nameless glowing portal meshes can be cyan with no 'door' in Name.
+        local col = part.Color
+        local cyan = col.B >= 0.65 and col.G >= 0.56 and col.R < 0.72
+            and col.B > col.R * 1.15 and col.G > col.R * 1.10
+        if cyan then cyanFound += 1 end
+        if named then namedFound += 1 end
+        if bad or not upright or not (cyan or named or inDoor) then return end
+        if not (part.Transparency < 0.99 or named or inDoor) then return end
+        local nearSign = signPos and (part.Position-signPos).Magnitude < 55
+        local nearRocket = reference and (part.Position-reference).Magnitude < 110
+        -- A generic blue object is only credible on the actual rocket or
+        -- next to its sign. A standalone named door must belong to this plot.
+        if not (inRocket or inDoor or nearSign or (named and nearRocket) or (cyan and not reference)) then return end
+        if not (inRocket or inDoor or nearSign or nearRocket or named) then return end
+        local distance = root and (part.Position-root.Position).Magnitude or 0
+        local score = (inDoor and 250 or 0) + (inRocket and 125 or 0)
+            + (cyan and 115 or 0) + (named and 110 or 0)
+            + (nearSign and 95 or 0) + (nearRocket and 24 or 0)
+            + (part.CanTouch and 18 or 0)
             + (part.Material == Enum.Material.Neon and 12 or 0)
-        if n:find('portal',1,true) or n:find('teleport',1,true)
-            or n:find('boarding',1,true) then score += 55 end
-        if score > bestScore then best, bestScore = part, score end
+            - math.min(distance/35,24)
+        if n:find('portal',1,true) or n:find('teleport',1,true) then score += 60 end
+        state.portalCandidates += 1
+        if not bestScore or score > bestScore then best, bestScore = part, score end
     end
+    -- Scan the player's own plot only, never another player's rocket.
     if rocket then
         for _, part in ipairs(rocket:GetDescendants()) do consider(part) end
     end
-    -- Live builds may parent the portal under a different plot decoration,
-    -- rather than replacing PortalDoor.Boarding itself.
-    if not best then
-        for _, part in ipairs(plot:GetDescendants()) do
-            if not rocket or not part:IsDescendantOf(rocket) then consider(part) end
+    for _, part in ipairs(plot:GetDescendants()) do
+        if not rocket or not part:IsDescendantOf(rocket) then consider(part) end
+    end
+    -- Some live decoration builders parent a door under Workspace instead of
+    -- the plot. Search only close to the player's own rocket/sign, and never
+    -- borrow a portal from someone else's plot.
+    if not best and reference then
+        local plotsFolder=WS:FindFirstChild('Plots')
+        for _, part in ipairs(WS:GetDescendants()) do
+            if part:IsA('BasePart') and not part:IsDescendantOf(plot)
+                and (not plotsFolder or not part:IsDescendantOf(plotsFolder))
+                and (part.Position-reference).Magnitude<45 then
+                consider(part)
+            end
         end
     end
+    local signText = signPos and 'yes' or 'no'
+    state.portalScanNote=string.format('parts %d | cyan %d | named %d | sign %s | candidates %d',
+        inspected,cyanFound,namedFound,signText,state.portalCandidates)
     if best then
-        state.portalScanResult = best
-        state.portalLocation = best:GetFullName()
-        state.portalDetectedBy = 'Automatic'
+        state.portalScanResult=best
+        state.portalLocation=best:GetFullName()
+        state.portalDetectedBy='Live door part'
+        state.portalLastCandidate=best.Name
+        state.portalLastDistance=root and (root.Position-best.Position).Magnitude or -1
+        if os.clock()-state.portalLoggedScanAt>6 then
+            doorLog('Door detected',state.portalLastCandidate..' at '..tostring(math.floor(state.portalLastDistance))..' studs | '..state.portalScanNote)
+            state.portalLoggedScanAt=os.clock()
+        end
         return best
     end
-    state.portalDetectedBy = 'None'
+    state.portalLastCandidate = 'None'
+    state.portalLastDistance = -1
+    if os.clock()-state.portalLoggedScanAt>8 then
+        doorLog('Door scan: no entrance',state.portalScanNote..' | rocket '..tostring(rocket ~= nil))
+        state.portalLoggedScanAt=os.clock()
+    end
     return nil
 end
 local function portalExit()
@@ -565,86 +636,115 @@ end
 -- Walk through the entrance using the Humanoid so the SERVER receives
 -- physical character contact. CFrame tweens alone may never fire Touched.
 local function walkBlueDoor(entry)
-    local manual = type(entry) == 'table' and entry.manual == true
+    local manual = type(entry)=='table' and entry.manual==true
     if not manual and (not entry or not entry:IsA('BasePart')) then return false end
-    local _, root, humanoid = character()
-    if not root or not humanoid or humanoid.Health <= 0 then return false end
-
+    local _, root, hum = character()
+    if not root or not hum then return false end
     local center = entry.Position
-    -- A portal is normally a thin upright panel. Its thinnest horizontal
-    -- dimension indicates the side from which to walk through the doorway.
-    local axis = manual and entry.axis or ((entry.Size.X < entry.Size.Z)
-        and entry.CFrame.RightVector or entry.CFrame.LookVector)
-    axis = Vector3.new(axis.X,0,axis.Z)
-    if axis.Magnitude < 0.05 then return false end
-    axis = axis.Unit
-    local frontSign = (root.Position - center):Dot(axis) >= 0 and 1 or -1
-    -- Approach from the character's actual side. Reversing based on failures
-    -- could previously stage behind a solid rocket wall.
-    local portalBottom = center.Y - entry.Size.Y * 0.5
-    local height = portalBottom + 3
-    -- For unusually thin visual triggers preserve the player platform height.
-    if entry.Size.Y < 5 then height = root.Position.Y end
-    local span = math.clamp(math.min(entry.Size.X,entry.Size.Z) * 0.5 + 5, 5, 9)
-    local from = Vector3.new(center.X, height, center.Z) + axis * frontSign * span
-    local through = Vector3.new(center.X, height, center.Z) - axis * frontSign * (span + 3)
-
-    -- Stage just outside the doorway with the existing smooth travel logic.
-    -- Even if the stage clips the trigger, verify teleport before proceeding.
-    status('Approaching the blue SPACE BASE doorway')
-    portalPhase('Approaching door',string.format('distance %.1f studs', (root.Position-from).Magnitude))
-    if (root.Position - from).Magnitude > 3.5 then
-        tweenDirect(from, center, 35)
-        if portalReached(true) then return true end
+    local axis
+    if manual then
+        axis=entry.axis
+    else
+        axis=(entry.Size.X < entry.Size.Z)
+            and entry.CFrame.RightVector or entry.CFrame.LookVector
     end
-    if not alive or not settings.master or (not manual and not entry:IsDescendantOf(WS)) then return false end
-    local _, stagedRoot = character()
-    if not stagedRoot or (stagedRoot.Position - from).Magnitude > 12 then
-        status('Space doorway approach incomplete; retrying safely')
-        state.portalLastError = 'Unable to reach approach point'
-        doorLog('Approach failed',string.format('distance %.1f studs', stagedRoot and (stagedRoot.Position-from).Magnitude or -1))
+    axis=Vector3.new(axis.X,0,axis.Z)
+    if axis.Magnitude<0.05 then
+        state.portalLastError='Door facing vector invalid'
+        doorLog('Door orientation invalid',tostring(entry.Name))
         return false
     end
-    cancelTravel() -- Restore collisions: allow a real Humanoid contact event.
-    local _, liveRoot, liveHum = character()
-    if not liveRoot or not liveHum or liveHum.Health <= 0 then return false end
-    status('Walking through the blue SPACE BASE door')
-    portalPhase('Walking through doorway', state.portalDetectedBy)
+    axis=axis.Unit
+    local side = (root.Position-center):Dot(axis)>=0 and 1 or -1
+    local bottom=center.Y-entry.Size.Y/2
+    local walkY=math.clamp(root.Position.Y,bottom+2,center.Y+1.0)
+    local groundPoint=Vector3.new(center.X,walkY,center.Z)
+    local front=groundPoint+axis*side*5
+    local through=groundPoint-axis*side*6
+    local function pos(v)
+        return string.format('(%.1f,%.1f,%.1f)',v.X,v.Y,v.Z)
+    end
+    state.portalMovement='Target '..pos(center)..' | start '..pos(root.Position)
+    doorLog('Door target',pos(center)..' | start '..pos(root.Position)..' | stage '..pos(front))
+    status('Going straight to Space door')
+    portalPhase('Going to door', 'Door detected; ground jobs paused')
+    if (root.Position-front).Magnitude>4 then
+        local stageOk=tweenDirect(front,center,35)
+        if portalReached(true) then
+            doorLog('Teleport occurred during approach','Space position confirmed')
+            return true
+        end
+        local _, afterRoot=character()
+        local afterDist=afterRoot and (afterRoot.Position-front).Magnitude or -1
+        state.portalMovement='Stage distance '..string.format('%.1f',afterDist)..' | reached '..tostring(stageOk)
+        doorLog('Approach result','stageReached='..tostring(stageOk)..' | remaining '..string.format('%.1f',afterDist)..' studs')
+        if not afterRoot or afterDist>13 then
+            state.portalLastError='Could not approach doorway; distance '..string.format('%.1f',afterDist)
+            return false
+        end
+    end
+    cancelTravel() -- Allow normal touch physics for the actual trigger.
+    local _, liveRoot, liveHum=character()
+    if not liveRoot or not liveHum then return false end
+    portalPhase('Walking into door','Humanoid:MoveTo')
+    doorLog('Walk started','from '..pos(liveRoot.Position)..' to '..pos(through))
     liveHum:MoveTo(through)
-    local deadline = os.clock() + 9
-    local lastPosition = liveRoot.Position
-    local stoppedAt = os.clock()
-    local jumped = false
-    while alive and settings.master and os.clock() < deadline do
-        if portalReached(true) then return true end
-        local _, nowRoot, nowHum = character()
-        if nowRoot ~= liveRoot or not nowRoot or not nowRoot.Parent
-           or not nowHum or nowHum.Health <= 0 then break end
-        if (nowRoot.Position - lastPosition).Magnitude > 1 then
-            lastPosition = nowRoot.Position
-            stoppedAt = os.clock()
-        elseif not jumped and os.clock() - stoppedAt > 1.3 then
-            nowHum.Jump = true
-            jumped = true
-        elseif os.clock() - stoppedAt > 3.5 then
+    local started=os.clock()
+    local nextSample=started+1
+    local lastPos=liveRoot.Position
+    local stalledAt=started
+    local jumped=false
+    while alive and settings.master and os.clock()-started<10 do
+        if portalReached(true) then
+            state.portalMovement='Teleported to Space'
+            doorLog('Teleport confirmed','after '..string.format('%.1f',os.clock()-started)..' seconds')
+            return true
+        end
+        local _, r, h=character()
+        if not r or not h or h.Health<=0 then
+            state.portalLastError='Character changed while walking to portal'
+            doorLog('Walking interrupted',state.portalLastError)
+            return false
+        end
+        if (r.Position-lastPos).Magnitude>0.75 then
+            lastPos=r.Position
+            stalledAt=os.clock()
+        elseif os.clock()-stalledAt>1.7 and not jumped then
+            jumped=true
+            h.Jump=true
+            doorLog('Walking obstruction','Jumping once to clear entrance')
+        end
+        if os.clock()>=nextSample then
+            nextSample=os.clock()+1
+            local remaining=(r.Position-groundPoint).Magnitude
+            state.portalMovement='Walking | center distance '..string.format('%.1f',remaining)
+            doorLog('Walk position',pos(r.Position)..' | distance to door '..string.format('%.1f',remaining))
+        end
+        if os.clock()-stalledAt>4 then
+            state.portalLastError='Blocked while walking through the door'
             break
         end
-        if (nowRoot.Position - through).Magnitude < 2.5 then
-            -- Contact may resolve on the next server frame, not immediately.
-            local untilArrival = os.clock() + 1.2
-            while alive and settings.master and os.clock() < untilArrival do
-                if portalReached(true) then return true end
-                task.wait(0.09)
+        if (r.Position-through).Magnitude<2.5 then
+            doorLog('Crossed doorway','Waiting 1.5s to see whether server teleports')
+            local deadline=os.clock()+1.5
+            while alive and settings.master and os.clock()<deadline do
+                if portalReached(true) then
+                    state.portalMovement='Teleported to Space'
+                    doorLog('Teleport confirmed','server moved player to Space')
+                    return true
+                end
+                task.wait(0.12)
             end
             break
         end
-        task.wait(0.09)
+        task.wait(0.12)
     end
-    if not portalReached(true) then
-        state.portalLastError = 'Crossed doorway but no Space teleport was confirmed'
-        doorLog('Door did not teleport',string.format('pos %.1f,%.1f,%.1f',liveRoot.Position.X,liveRoot.Position.Y,liveRoot.Position.Z))
-    end
-    return portalReached(true)
+    local _, endRoot=character()
+    local ending=endRoot and endRoot.Position
+    state.portalLastError=state.portalLastError=='None' and 'Reached door, but Space teleport not confirmed' or state.portalLastError
+    state.portalMovement='Failed | '..(ending and pos(ending) or 'character missing')
+    doorLog('Door test result',state.portalLastError..' | final '..state.portalMovement)
+    return false
 end
 
 local function activatePortal(trigger, spaceDestination)
@@ -690,6 +790,10 @@ local function useSpacePortal(spaceDestination)
         return false
     end
     state.portalLastTry = os.clock()
+    state.portalLastError = 'None'
+    state.portalMovement = 'Starting'
+    doorLog('Attempt # '..tostring(state.portalTrips+state.portalFailures+1),
+        'source '..state.portalDetectedBy..' | '..state.portalLocation)
     portalPhase('Entering doorway',state.portalLocation)
     local success = activatePortal(trigger,spaceDestination)
     if success then
@@ -703,8 +807,9 @@ local function useSpacePortal(spaceDestination)
     end
     state.portalFailures += 1
     portalPhase('Retry pending',state.portalLastError)
-    state.portalRetryAfter = os.clock() + 12
-    status('Door crossing not confirmed; retrying after cooldown')
+    state.portalRetryAfter = os.clock() + 10
+    doorLog('Retry scheduled','10s | '..state.portalLastError)
+    status('Door attempt ended: '..state.portalLastError)
     return false
 end
 local function tweenTo(point, lookAt, maxTime)
@@ -770,15 +875,19 @@ local function enforceSpaceResidence(plot)
     local door = portalEntry(plot)
     local ready = spaceUnlocked(plot, door)
     state.spaceDoorReady = door ~= nil
+    if door and not state.spaceCommitted then
+        state.portalPreemptions += 1
+        doorLog('Ground tasks preempted','Visible door is present; going to it now')
+    end
     if not ready and not state.spaceCommitted then
-        state.spaceResidence = 'Waiting for Space unlock'
-        state.portalPriority = 'Ground while locked'
+        state.spaceResidence = 'Waiting for Space door or unlock'
+        state.portalPriority = 'Ground while no Space door exists'
         return false
     end
     state.spaceCommitted = true
     state.portalPriority = 'Portal entry (ground paused)'
     if not door then
-        state.spaceResidence = 'Space ready; locating live blue doorway'
+        state.spaceResidence = 'Space ready; looking for door'
         status('Space unlocked: doorway not detected; open Debug for details')
         state.portalLastError = 'Door part not found - use Mark Door Here if needed'
         portalPhase('Door not found','Rocket may contain empty placeholder models')
@@ -850,6 +959,11 @@ local function doorReport()
         'PortalDoor model: '..(savedDoor and savedDoor:GetFullName() or 'Not found'),
         'PortalDoor children: '..(savedDoor and tostring(#savedDoor:GetDescendants()) or 'none'),
         'Door selection: '..state.portalDetectedBy,
+        'Scanner: '..state.portalScanNote,
+        'Candidate selected: '..state.portalLastCandidate,
+        'Candidate distance: '..tostring(state.portalLastDistance),
+        'Movement: '..state.portalMovement,
+        'Door priority preemptions: '..tostring(state.portalPreemptions),
         'Selected door: '..state.portalLocation,
         'Door candidates: '..tostring(state.portalCandidates),
         'Nearby blue/door parts: '..tostring(parts),
@@ -1879,6 +1993,12 @@ options:CreateToggle({Name='Focus Space Progression',CurrentValue=settings.space
 options:CreateToggle({Name='Fast Spaceship Hull Cleaning',CurrentValue=settings.fastSpaceWash,Callback=function(v) settings.fastSpaceWash=v end})
 options:CreateToggle({Name='Auto Enter & Stay in Space',CurrentValue=settings.autoEnterAndStaySpace,Callback=function(v)
     settings.autoEnterAndStaySpace=v
+    if v then
+        state.portalRetryAfter=0
+        state.portalScanAt=0
+        state.portalScanResult=nil
+        doorLog('Space mode enabled','Will go to door as soon as detected')
+    end
     if not v then
         state.spaceCommitted=false
         state.spaceDoorReady=false
@@ -1901,11 +2021,12 @@ local debugTab = window:CreateTab('Debug')
 debugTab:CreateSection('Space doorway')
 doorDebugLabel = debugTab:CreateLabel('Waiting for Space door check')
 doorLogLabel = debugTab:CreateLabel('Recent door activity will appear here')
-debugTab:CreateButton({Name='Retry Blue Door Now',Callback=function()
+debugTab:CreateButton({Name='Test Door Now',Callback=function()
+    settings.autoEnterAndStaySpace=true
     state.portalRetryAfter = 0
     state.portalScanAt = 0
     state.portalScanResult = nil
-    doorLog('Manual retry requested','Controller will try on its next tick')
+    doorLog('Test Door Now','Forced a new live scan; next controller tick will approach the door')
     status('Retrying Space doorway')
 end})
 debugTab:CreateButton({Name='Mark Door Here (stand facing blue door)',Callback=function()
@@ -1981,11 +2102,12 @@ task.spawn(function()
                     doorDebugLabel:Set('Phase: '..state.portalPhase..' | Door: '..state.portalDetectedBy
                         ..' | Ready: '..tostring(state.spaceDoorReady)..' | Attempts: '
                         ..tostring(state.portalTrips+state.portalFailures)..' | Retry: '..remaining..'s'
-                        ..' | Error: '..state.portalLastError)
+                        ..' | Error: '..state.portalLastError
+                        ..' | '..state.portalScanNote) 
                 end
                 if doorLogLabel then
                     local rows={}
-                    for i=math.max(1,#doorLogs-3),#doorLogs do rows[#rows+1]=doorLogs[i] end
+                    for i=math.max(1,#doorLogs-5),#doorLogs do rows[#rows+1]=doorLogs[i] end
                     doorLogLabel:Set(#rows>0 and table.concat(rows,' / ') or 'No door attempts yet')
                 end
                 if detailLabel then detailLabel:Set('Cash '..money(cash())..' | '..state.bought..' buys | '..state.sprays..' sprays | '..state.bonuses..' bonuses | '..state.availablePurchasePads..' buyable | Boats '..state.boatBuys..' buys / '..state.boatSprays..' sprays | Planes '..state.planeBuys..' buys / '..state.planeSprays..' sprays | Space '..state.spaceBuys..' buys / '..state.spaceSprays..' sprays | Portal '..state.spaceResidence..' | Priority '..state.portalPriority..' | Trips '..state.portalTrips..' / '..state.portalFailures..' fails') end
@@ -2057,4 +2179,4 @@ task.spawn(function()
     end
 end)
 
-PuckUI:Notify({Title='Wash the Car v1.11',Content='Simpler Space entry. Open Debug to retry, mark the blue door if needed, or copy a failure report.',Duration=5})
+PuckUI:Notify({Title='Wash the Car v1.12',Content='When the blue door appears, move directly to it. Debug records each movement and teleport result.',Duration=5})
