@@ -1,10 +1,13 @@
 --[[
-    PuckAFK | Wash the Car | Smart Autofarm v1.7
+    PuckAFK | Wash the Car | Smart Autofarm v1.8
     Place 70733580049633
     Audited against the supplied 2026-10-19 .rbxl and network log.
 
     Smart tycoon purchases, legitimate client-side dirt erasing, native-format
     spray batching, free bonuses, player upgrades, offline claim and smooth travel.
+    v1.8: auto-enter the blue door as soon as a live trigger is ready,
+    commit to Space-only washing/purchasing and stay there through idle and
+    respawns without returning to ground for older tycoon tasks.
     v1.7: actual SpaceRocket blue-door entry and ReturnTouch exit, no direct
     cross-zone altitude tween, portal activation checks and recovery.
     v1.6: Space pads/upgrade chains, parked spacecraft tracking, warp-route guards,
@@ -66,6 +69,7 @@ local settings = {
     spaceWash = true, spacePurchases = true, spaceFocus = true,
     fastSpaceWash = true, spaceSpacing = 3.0, spaceRayBudget = 140,
     spaceStandRadius = 76, spaceTravelSpeed = 240, useSpaceDoor = true,
+    autoEnterAndStaySpace = true,
 }
 local state = {
     status = 'Starting', plot = nil, target = nil, currentTween = nil,
@@ -82,6 +86,7 @@ local state = {
     planesDetected = 0, planeSprays = 0, planeBuys = 0, planesOutOfStand = 0,
     shipsDetected = 0, spaceSprays = 0, spaceBuys = 0, shipsOutOfStand = 0,
     portalTrips = 0, portalFailures = 0, portalRetryAfter = 0, portalPhase = 'Idle',
+    spaceCommitted = false, spaceResidence = 'Waiting for unlock', spaceDoorReady = false,
 }
 local PlaneConfig, PlanePaths, SpaceConfig
 local planePathCache = setmetatable({}, {__mode = 'k'})
@@ -554,11 +559,65 @@ local function tweenTo(point, lookAt, maxTime)
     if not root or typeof(point) ~= 'Vector3' then return false end
     -- Mandatory both-way transition: never tween between Y=0 and Y=4000.
     local spaceDestination = highWorld(point)
+    -- Space residence is sticky: never invoke the return portal or try to
+    -- tween to a ground target while the auto-stay mode is committed.
+    if settings.autoEnterAndStaySpace and state.spaceCommitted and not spaceDestination then
+        status('Staying in Space: ground destination skipped')
+        return false
+    end
     if highWorld(root.Position) ~= spaceDestination then
         if not useSpacePortal(spaceDestination) then return false end
     end
     if not portalReached(spaceDestination) then return false end
     return tweenDirect(point,lookAt,maxTime)
+end
+
+-- Space is a progression phase, not simply another scored destination.
+-- Door readiness must be grounded in BOTH the player's replicated unlock and
+-- a real, touchable trigger constructed in the live PortalDoor. The saved
+-- place dump only has an empty Boarding placeholder until runtime.
+local function wantsSpaceResidence(plot)
+    return settings.autoEnterAndStaySpace and settings.useSpaceDoor and plot
+       and (plot:GetAttribute('SpaceZoneActive') == true or state.spaceCommitted)
+end
+local function spaceOnlyTargets(plot)
+    return wantsSpaceResidence(plot) and state.spaceCommitted
+end
+local function enforceSpaceResidence(plot)
+    if not wantsSpaceResidence(plot) then
+        state.spaceCommitted = false
+        state.spaceDoorReady = false
+        state.spaceResidence = 'Off / not unlocked'
+        return false
+    end
+    if portalReached(true) then
+        state.spaceCommitted = true
+        state.spaceDoorReady = true
+        state.spaceResidence = 'Staying in Space'
+        return false -- Keep farming, but only within the Space world.
+    end
+    if not state.spaceCommitted then
+        local entry = portalEntry(plot)
+        state.spaceDoorReady = entry ~= nil
+        if not entry then
+            state.spaceResidence = 'Waiting for blue door to activate'
+            return false -- Not ready yet: continue ordinary ground progression.
+        end
+        state.spaceCommitted = true -- Never let ground purchases pull us back.
+        state.spaceResidence = 'Door ready; entering Space'
+    end
+    if os.clock() < state.portalRetryAfter then
+        state.spaceResidence = 'Waiting for portal retry'
+        status('Space door ready • retry in '..math.ceil(state.portalRetryAfter - os.clock())..'s')
+        return true -- Pause ground actions, not the portal retry logic.
+    end
+    state.spaceResidence = 'Entering Space'
+    if useSpacePortal(true) then
+        state.spaceResidence = 'Staying in Space'
+    else
+        state.spaceResidence = 'Waiting for portal retry'
+    end
+    return true -- One serialized portal attempt per controller cycle.
 end
 
 local Wash = RS:WaitForChild('Wash', 20)
@@ -668,6 +727,7 @@ local function chooseVehicle(plot)
             if model and (not boat or settings.boatWash)
                and (not plane or settings.planeWash)
                and (not ship or settings.spaceWash)
+               and (not spaceOnlyTargets(plot) or highWorld(part.Position))
                and animationSettled(model)
                and (not boat or boatReady(model))
                and (not plane or planeReady(model, plot))
@@ -1244,6 +1304,7 @@ local function purchaseCandidates(plot)
                                 if kind and (groupName ~= 'BoatSlots' or settings.boatPurchases)
                                   and (groupName ~= 'PlaneSlots' or settings.planePurchases)
                                   and (groupName ~= 'SpaceSlots' or settings.spacePurchases)
+                                  and (not spaceOnlyTargets(plot) or highWorld(act.Position))
                                   and (buttonBackoff[pad] or 0) <= os.clock()
                                   and (groupName ~= 'Slots' or not originalBayPads or originalBayPads[pad])
                                   and slotReady(slot,pad,groupName)
@@ -1565,6 +1626,14 @@ options:CreateToggle({Name='Buy Space Stands & Equipment',CurrentValue=settings.
 options:CreateToggle({Name='Focus Space Progression',CurrentValue=settings.spaceFocus,Callback=function(v) settings.spaceFocus=v end})
 options:CreateToggle({Name='Fast Spaceship Hull Cleaning',CurrentValue=settings.fastSpaceWash,Callback=function(v) settings.fastSpaceWash=v end})
 options:CreateToggle({Name='Use Blue Door to Travel to Space',CurrentValue=settings.useSpaceDoor,Callback=function(v) settings.useSpaceDoor=v end})
+options:CreateToggle({Name='Auto Enter Blue Door & Stay in Space',CurrentValue=settings.autoEnterAndStaySpace,Callback=function(v)
+    settings.autoEnterAndStaySpace=v
+    if not v then
+        state.spaceCommitted=false
+        state.spaceDoorReady=false
+        state.spaceResidence='Manual zone selection'
+    end
+end})
 options:CreateSection('Expansion')
 options:CreateToggle({Name='Unlock New Zones',CurrentValue=settings.zones,Callback=function(v) settings.zones=v end})
 options:CreateToggle({Name='Buy Decorations',CurrentValue=settings.decorations,Callback=function(v) settings.decorations=v end})
@@ -1608,7 +1677,7 @@ task.spawn(function()
             if os.clock() - lastUi > .6 then
                 lastUi = os.clock()
                 if statusLabel then statusLabel:Set(state.status) end
-                if detailLabel then detailLabel:Set('Cash '..money(cash())..' | '..state.bought..' buys | '..state.sprays..' sprays | '..state.bonuses..' bonuses | '..state.availablePurchasePads..' buyable | Boats '..state.boatBuys..' buys / '..state.boatSprays..' sprays | Planes '..state.planeBuys..' buys / '..state.planeSprays..' sprays | Space '..state.spaceBuys..' buys / '..state.spaceSprays..' sprays | Portals '..state.portalTrips..' trips / '..state.portalFailures..' fails') end
+                if detailLabel then detailLabel:Set('Cash '..money(cash())..' | '..state.bought..' buys | '..state.sprays..' sprays | '..state.bonuses..' bonuses | '..state.availablePurchasePads..' buyable | Boats '..state.boatBuys..' buys / '..state.boatSprays..' sprays | Planes '..state.planeBuys..' buys / '..state.planeSprays..' sprays | Space '..state.spaceBuys..' buys / '..state.spaceSprays..' sprays | Portal '..state.spaceResidence..' | Trips '..state.portalTrips..' / '..state.portalFailures..' fails') end
             end
             local nowCash = cash()
             if nowCash ~= state.lastCash then
@@ -1622,9 +1691,16 @@ task.spawn(function()
                 buttonBackoff = setmetatable({}, {__mode='k'})
                 vehicleBackoff = setmetatable({}, {__mode='k'})
                 cancelTravel()
+                state.spaceCommitted = false -- Reset on plot ownership changes.
+                state.spaceDoorReady = false
+                state.spaceResidence = 'Checking door'
             end
             local _, root = character()
             if not root then status('Respawning'); task.wait(.5); return end
+            -- As soon as the unlocked blue door has an actual live trigger,
+            -- enter Space even if there are still affordable ground purchases.
+            -- On respawn, re-enter through the door instead of resuming ground.
+            if enforceSpaceResidence(plot) then task.wait(.35); return end
             claimOffline()
             -- Buy active, affordable machinery before personal upgrades so a
             -- continuously affordable Income upgrade cannot starve station buys.
@@ -1656,4 +1732,4 @@ task.spawn(function()
     end
 end)
 
-PuckUI:Notify({Title='Wash the Car v1.7',Content='Space blue-door and return teleporter travel required, with verified arrivals and retry cooldowns.',Duration=5})
+PuckUI:Notify({Title='Wash the Car v1.8',Content='Automatically enter the unlocked blue door, stay in Space, and focus on Space-only progress.',Duration=5})
